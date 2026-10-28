@@ -5627,7 +5627,23 @@ class DeepseekV4ForCausalLM(nn.Module):
                     #     由 dsv4/sparse_prefill_utils.combine_topk_swa_indices 生成
                     #     （HCU 上有 LightOp 融合版 combine_topk_swa_indices_hcu）
                     #   · sparse_raw_indices：同形状的中转缓冲，只有 prefill 需要
-                    #     （decode 的索引能由 page table 直接算，不需要 combine）
+                    #       topk kernel（dsv4/indexer.py:_topk_transform_vectorized）
+                    #       一次算出【两份坐标】：
+                    #         page_indices = (物理页 << page_bits) | 页内偏移 → 池里的 slot
+                    #         raw_indices  = top-k 原始下标                → 请求内的"第几个位置"
+                    #       稀疏 prefill 要先建一块按"每请求压缩区"连续排布的 flat
+                    #       workspace，top-k 结果必须靠 flat = compressed_base[r] + pos
+                    #       线性 rebase 才能落到 workspace 行号上（见
+                    #       dsv4/sparse_prefill_utils.combine_topk_swa_indices 的
+                    #       docstring："Top-k indices are int32 [num_tokens, K] in each
+                    #       request's compressed region"）。
+                    #       物理 slot 是散落的池地址，无法与 base 线性相加，所以 prefill
+                    #       必须保留 raw；decode 不建 workspace、直接在原池上做 paged
+                    #       attention，只需要 page。
+                    #       c128 例外：它不是 top-k 选择，而是"位置之前的每个压缩块"，
+                    #       直接 remap 页索引，所以 set_sparse_topk 里
+                    #       assert raw_indices is None, "c128 has no raw top-k"。
+                    #       无效项一律填 -1（combine 的契约要求 topk_len 内为 -1）。
                     #   · sparse_topk_lengths：每行实际有效长度（clamp 到 index_topk）
                     #   · *_flashmla_metadata：FlashMLA 的 SM 调度方案
                     #     （flash_mla.get_mla_metadata()），按长度与行数算出

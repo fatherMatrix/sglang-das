@@ -1247,11 +1247,13 @@ class LateLayerTail(msgspec.Struct, frozen=True):
         local_lens / local_lens_cpu        CP 时：本 rank 每请求的尾行数
 
       每行（长度 = Σ 尾长，按请求分组、组内保持原顺序）
-        token_indices          尾行在【原 extend】里的行号
-        positions              这些行的绝对位置
-        swa_out_cache_loc      SWA 写落点
-        req_global / pos_global  每行的请求号与位置（CP 压缩/广播用）
-        global_token_indices   CP 时保留的整批行号（DSpark 注入按全局索引）
+        token_indices          (Σ尾长,) int64   尾行在【原 extend】里的行号
+        positions              (Σ尾长,)         这些行的绝对位置
+        swa_out_cache_loc      (Σ尾长,)         SWA 写落点
+        req_global / pos_global                 每行的请求号与位置（CP 压缩/广播用）
+        global_token_indices   (Σ尾长,) int64   CP 时保留的整批行号（DSpark 注入按全局索引）
+        ★ 注意第 0 维是 Σ尾长，不是 bs×128：短 extend 的请求只贡献
+          min(128, extend) 行，拼接后没有填充行。
 
     例：3 个请求 extend = 1000 / 200 / 50，tail_len = 128
         extend_seq_lens = [128, 128, 50]        （每请求，长度 3）
@@ -2431,11 +2433,20 @@ class DeepseekV4AttnBackend(
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
         device = forward_batch.out_cache_loc.device
         # 【Q2 ①】纯 CPU 长度表 → 三个每行/每请求量（不碰 GPU 数据）：
-        #   tail_lens_cpu      每请求：min(SWA_WINDOW, extend_len)
-        #   token_indices      每行：尾行在【原 extend】里的行号（按请求分组、组内保原序）
-        #   swa_replay_start   每行：窗口下界 floor = seq_len - tail_len
+        #   tail_lens_cpu      list[int]  len = bs      每请求：min(SWA_WINDOW, extend_len)
+        #   token_indices      int64      (Σ尾长,)      每行：尾行在【原 extend】里的行号
+        #                                               （按请求分组、组内保原序）
+        #   swa_replay_start   int32      (Σ尾长,)      每行：窗口下界 floor = seq_len - tail_len
         #                      ★ floor 锁在尾段起点，保证晚层不会去读尾段之前、
         #                        本次没写过的 SWA 行（这是正确性的关键）
+        #
+        #   形状要点：两个张量的第 0 维都是 Σ尾长 —— 不是 bs，也不是 bs×128。
+        #   例：extend_lens=[200, 50]，SWA_WINDOW=128
+        #         tail_lens_cpu   = [128, 50]              （len=2）
+        #         token_indices   = (178,) int64  [72..199, 200..249]
+        #         swa_replay_start= (178,) int32  [5072]*128 + [0]*50
+        #   其中请求1 的 token_indices 从 200 起（批内行号，紧跟请求0 的 200 行），
+        #   而 floor=0 是它自己的绝对位置 —— 两者不在同一坐标系，不能互相索引。
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_cpu.tolist(),

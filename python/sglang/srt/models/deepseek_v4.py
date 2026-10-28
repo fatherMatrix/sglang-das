@@ -5551,6 +5551,29 @@ class DeepseekV4ForCausalLM(nn.Module):
         #     · 若开了 decoder bounded replay，尾段元数据是在切分前构造的，
         #       必须用 convert_late_layer_tail_to_hcu_cp 转成 CP 布局；
         #       不支持转换的后端直接报错，而不是静默用错布局
+        #
+        # ★ V4.1 是否走到本块？在 HCU + CP8 下答案是"走"，条件链如下：
+        #     1) not enable_cp_v2()
+        #        enable_cp_v2() = not (is_hcu() or is_npu() or is_musa())
+        #        → HCU 上返回 False → not False = True
+        #     2) self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        #        → attn_cp_size > 1；且 is_hip() 为真时只看 is_deepseek_v4()
+        #        → V4.1 的 config 在归一化时把 architectures 从
+        #          "DeepseekV41ForCausalLM" 改写成 "DeepseekV4ForCausalLM"
+        #          （configs/deepseek_v41.py: normalize_deepseek_v41_config）
+        #        → 命中 is_deepseek_v4 的架构白名单 → True
+        #     3) can_dsa_cp_split(len(input_ids), cp_size, True, forward_batch)
+        #        → 要求是 CP extend、且 sum(extend_seq_lens) >= cp_size；
+        #          round-robin 切法还要求 len(input_ids) % cp_size == 0（padding 保证）
+        #   注意 3) 的小批回退：短批（例如 warmup）不满足时，本块不生成
+        #   attn_cp_metadata，这一批就不切 token。但 LayerSplit 池仍然只持有
+        #   自己的层，所以 cp_cache_layer_split 的 helpers 里专门注明
+        #   "Even short extend/warmup batches without attn_cp_metadata still
+        #   read the layer-sharded cache"。
+        #
+        #   容易误判的地方：本块在 ForCausalLM.forward（进模型之前），
+        #   而"V4.1 走 _forward_layers_hc_pre_from_prev"指的是 Model.forward
+        #   内部的层循环。两者是同一次 forward 的两段，不是二选一。
         if not enable_cp_v2() and self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(

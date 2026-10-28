@@ -513,6 +513,27 @@ def late_layer_tail_layout(
         # 交付顺序与多请求分支一致：(token_indices, tail_lens_cpu, floor)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
     # ---- 多请求：一次 H2D 拿三组长度，其余全在设备上推导 ----
+    #
+    # ★ H2D 就发生在【下一行】：
+    #     torch.tensor([...], device=device)
+    #   入参是 3 个 Python list（在主机内存），目标 device 是加速器，
+    #   所以这一次构造 = 一次 主机→设备 拷贝。
+    #   数据量 = 3 × bs × 8 字节（int64），与"尾行总数"无关。
+    #
+    # ★ "其余在设备上推导"指它之后的每一步都是设备端算子：
+    #     lens 切片 / arange / repeat_interleave / cumsum / [req] 索引 /
+    #     逐元素加减 / .to(int32)
+    #   全过程中没有任何 .item() / .tolist() / 依赖张量取值的 Python if，
+    #   因此不会触发 设备→主机 的同步（那才是真正会让流水线停顿的操作）。
+    #
+    # ★ 为什么不在主机上把三个结果都算好再一次性拷上来？
+    #   那样要构造长度 Σ尾长 的 Python list 再整体拷贝（bs=64、Σ=8192 时
+    #   约 64KB，外加 8192 次 Python 循环）；现在只拷 3×bs 个标量（约 1.5KB），
+    #   由设备自己展开。H2D 的量从 O(Σ尾长) 降到 O(bs)，且 kernel 启动次数
+    #   与 bs 无关（原注释："launch count does not grow with bs"）。
+    #
+    # 对照单请求快路径：那里的 n/t/s 都是 Python 标量，torch.full 的填充值和
+    # arange 的起止都作为【kernel 参数】传入，不需要任何张量参与拷贝 → 0 次 H2D。
     # One H2D copy for the three length vectors; launch count does not grow with bs.
     lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
     extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]

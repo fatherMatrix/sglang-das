@@ -2563,58 +2563,87 @@ class DeepseekV4AttnBackend(
         token_indices: torch.Tensor,
         tail_lens: torch.Tensor,
     ) -> dict:
-        """把"整批尾段"改写成"本 rank 的尾段 + 全 rank 等长布局"。
+        """解决什么问题：**分活分不匀，但收工时要交出同样多**。
+
+        用发牌来想这件事。
+
+        【背景】晚层要算的是一批"尾行"（每请求最后 128 个 token），
+        一共 total 行，排成一张清单：
+
+            清单:  [行0][行1][行2] ... [行 total-1]
+
+        【矛盾】CP 的 8 个 rank 要按 i % 8 把这张清单分掉，各算各的，
+        算完再用 all-gather 收回来。而 all-gather 有个硬要求：
+        **8 个人必须交出同样张数**，否则集合通信对不齐。
+
+        可是 50 行分给 8 个人，不可能人人一样：
+
+            0号 7 行、1号 7 行、2~7号 各 6 行      ← 有人少一行
+
+        于是本函数就干三件事：
+
+        ┌─ ① 分活 ─────────────────────────────────────────────┐
+        │ 第 i 行归 i % 8 号。本 rank 只把自己那几行拿走。        │
+        └──────────────────────────────────────────────────────┘
+        ┌─ ② 补齐 ─────────────────────────────────────────────┐
+        │ 只有 6 行的人补 1 行【空白行】，凑到 7 行。             │
+        │ 空白行没有任何 query 会读到，纯粹为了形状一样。          │
+        └──────────────────────────────────────────────────────┘
+        ┌─ ③ 还原 ─────────────────────────────────────────────┐
+        │ 收回来的结果按"人"排：                                │
+        │     [0号的7行][1号的7行][2号的7行]...[7号的7行]         │
+        │ 但我们要的是原来的顺序 行0 行1 行2 ...                  │
+        │ 所以要一张对照表：第 i 行收回来后站在第几个位置。        │
+        └──────────────────────────────────────────────────────┘
+
+        对应三个产物：
+            local_index    "本 rank 拿走哪几行"（含空白行的占位号）
+            pad_rows       "补几行"
+            gather_index   "第 i 行 → 收回来后的第几个位置"
 
         ==================================================================
-        为什么需要它
+        两个坐标（容易混，务必分清）
         ==================================================================
-        晚层尾部（bounded replay 的 tail）是按**整批行号**描述的。CP 切分之后：
-          · 本 rank 只该处理 t % cp_size == cp_rank 的那些行；
-          · 但各 rank 分到的行数不一定相等（total 未必被 cp_size 整除，
-            而且不同请求的尾长可能不是 128）。
-        而尾段在跑的时候要参与集合通信（all-gather 还原全局尾序）、
-        形状必须所有 rank 一致。于是需要：
-          ① 选出本 rank 的行；
-          ② 用私有填充行补到 max_local 行，使形状统一；
-          ③ 给出一个索引，让 all-gather 之后能把 rank-major 的顺序
-             还原成"全局尾序"。
+          原位置 (global row)   0 .. total-1
+              按"行的原始编号"数，就是清单里的下标。
+
+          收回位置 (packed)     0 .. cp_size*max_local-1   （例：0..55）
+              按"人 + 组内第几行"数：
+                  rank r 的块 = [r*max_local, r*max_local + max_local)
+
+          第 i 行（属于 rank r、是组内第 k 行）→ 收回位置 = r*max_local + k
+          这正是 gather_index[i]。all-gather 之后执行 output[gather_index]
+          就还原成 行0 行1 行2 ...
+
+          空白行没有"原位置"（本来不存在），但需要一个【占位号】放在
+          packed 空间里，所以从 total 往后排：占 [total, total+Σpad)。
+          每个 rank 分一段、互不重叠 —— 这就是下面 pad_start 的算法。
+          尺寸自洽：total + Σpad = cp_size * max_local ✔
 
         ==================================================================
-        三个坐标系（最容易搞混的地方）
+        算例（cp_size=8，单请求 extend=50 → 50 行全是尾行）
         ==================================================================
-          global row      0 .. total-1
-                          整批尾行号（token_indices 的值域是 extend 行号，
-                          这里用的是它在 tail 数组里的下标）
-          padded 空间     0 .. cp_size*max_local-1
-                          rank-major 的"等长块"拼起来的虚拟缓冲：
-                            [0, total)                      真实尾行
-                            [total+off_r, +pad_r)           各 rank 私有的填充行
-                          off_r = Σ_{k<r} pad_k，所以各 rank 的填充区互不重叠，
-                          并且 total + Σ pad = cp_size * max_local ✔
-          local row       0 .. max_local-1
-                          本 rank 自己那块的局部行号（送入 attention 的张量行号）
+            分活: 0号 → 0,8,16,24,32,40,48     (7 行)
+                  1号 → 1,9,17,25,33,41,49     (7 行)
+                  2号 → 2,10,18,26,34,42       (6 行) ← 少一行
+                  ...
+            补齐: 2号 补 1 行空白，占位号 50（因为 0、1 号不需要补）
+            收回: [0号块 0..6][1号块 7..13][2号块 14..20]...[7号块]
+
+          rank2 实际看到的东西：
+            local_index  = [2,10,18,26,34,42, 50]   6 行真数据 + 1 行空白
+            gather_index = [14,15,16,17,18,19]      它那 6 行在收回区的落点
 
         ==================================================================
-        算例（cp_size=8，单请求 extend=50 → 整段都是尾段，total=50）
+        六个返回值
         ==================================================================
-          counts        = [7,7,6,6,6,6,6,6]   max_local = 7
-          padded 空间    8×7 = 56 = 50 + Σpad(6)   ✔
-          rank2 的
-            local_index   = [2,10,18,26,34,42, 50]   ← 前 6 个是真实行，
-                                                        50 是它自己的填充行
-            gather_index  = [14..19]                 ← 落在 rank-major 的第 2 块
-
-        ==================================================================
-        返回的 6 项
-        ==================================================================
-          cp_metadata        InterleaveContextParallelMetadata，塞进
-                             forward_batch.attn_cp_metadata 供 all-gather 消费；
-                             其中 local_index 又被 apply_cp_reindex 当作行选择器
-          local_token_indices 本 rank 尾行的【局部 extend 行号】
-                             = (global_row - cp_rank) // cp_size
-          local_positions    本 rank 尾行的绝对位置（补齐到 max_local）
-          local_lens(_cpu)   本 rank 每请求各有几行（求和 = counts[cp_rank]）
-          pad_rows           本 rank 需要补几行
+          cp_metadata          打包好的元数据，all-gather 与 reindex 都吃它
+                               （其中 local_index / gather_index 就是上面那两张表）
+          local_token_indices  本 rank 的行在【自己的 extend】里是第几行
+                               = (global_row - cp_rank) // cp_size
+          local_positions      本 rank 各行的绝对位置（补齐到 max_local）
+          local_lens(_cpu)     本 rank 每个请求各几行（和 = counts[cp_rank]）
+          pad_rows             补了几行空白
         """
         cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size

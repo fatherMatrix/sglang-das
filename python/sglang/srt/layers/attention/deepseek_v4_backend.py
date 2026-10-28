@@ -1029,9 +1029,15 @@ class DSV4AttnMetadata:
         cp_size = get_parallel().attn_cp_size
         pre_global_len = self.seq_lens_casual.shape[0]
         if local_index is not None:
+            # 显式行号（非等步长的行集合，例如尾段 CP 布局由调用方算好）
             idx = local_index
             expected_local_len = local_index.shape[0]
         else:
+            # 等步长 round-robin：slice(start, stop, step) 等价于 [start:stop:step]，
+            # 这里即 [cp_rank::cp_size]，取第 cp_rank, cp_rank+cp_size, ... 行。
+            # 与归属规则一致：token t 归 rank t % cp_size。
+            # 用 slice 而不是直接写 val[cp_rank::cp_size]，是为了让两个分支共用
+            # 同一个 idx 变量（slice 和 Tensor 都能用于 val[idx]）。
             idx = slice(cp_rank, None, cp_size)
             assert pre_global_len % cp_size == 0, (
                 f"apply_cp_reindex: global token count {pre_global_len} is not divisible by cp_size={cp_size}. "

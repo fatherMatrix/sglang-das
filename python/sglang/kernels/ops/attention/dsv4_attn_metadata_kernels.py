@@ -444,24 +444,74 @@ def late_layer_tail_layout(
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
     """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
     Returns (token indices into the extend, per-request tail lengths, per-row
-    absolute window floor)."""
+    absolute window floor).
+
+    ==================================================================
+    在流程里的位置：decoder SWA bounded replay 的"第一步"
+    ==================================================================
+    调用者是 DeepseekV4AttnBackend._build_late_layer_tail_metadata（每个
+    prefill forward 一次）。它只做纯数学：把"每请求 extend 多长、历史多长"
+    两个 CPU 列表，换成"晚层要算的那批行"的描述。产出的三样东西：
+
+      token_indices : 每行（= 每个尾 token，见下）在【原 extend】里的行号
+      tail_lens_cpu : 每请求的尾长 = min(tail_len, extend_len)
+      floor         : 每行的 SWA 窗口下界（绝对位置）
+
+    ★ 两种粒度（同 LateLayerTail 的约定）：
+        每请求（长度 = bs）    tail_lens_cpu
+        每行  （长度 = Σ尾长） token_indices / floor
+        "行 = 一个 token"，按请求分组、组内保持原序。
+
+    ★ 算例（bs=2, tail_len=128, prefix=[5000, 0]）
+        extend_lens = [200, 50]  seq_lens = [5200, 50]
+        tail_lens   = [128, 50]  Σ = 178
+        行 0..127   : 请求0，token_indices = 72..199，  floor = 5072
+        行 128..177 : 请求1，token_indices = 200..249， floor = 0
+      注意 token_indices 是【批内 extend 行号】，不是请求内序号：
+        请求1 的 extend 排在请求0 的 200 行之后，所以它从 200 开始而不是 0。
+      而 floor 是【绝对位置】（请求 0 是 5072，请求 1 是 0）——
+      两者相差一个 prefix_len。floor 恰好等于"该请求尾段第一行的绝对位置"：
+        seq_len - tail_len
+      （请求0：5200-128 = 5072；请求1：50-50 = 0。）
+
+    ★ 两个分支与代价
+        单请求：arange + full，零 H2D
+        多请求：把三组长度打成一个 (3, bs) 张量做【一次】H2D，
+                之后全部在设备上算 —— 启动次数不随 bs 增长
+                （注释原话："launch count does not grow with bs"）
+    ==================================================================
+    """
+    # 每请求尾长：不足一个窗口就取整个 extend（短 extend 不补零）。
+    # 这一步纯 CPU，因为输入本来就是 CPU 列表。
     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
     if len(extend_lens_cpu) == 1:
+        # ---- 单请求快路径：尾段就是 extend 的最后 t 行，可以零拷贝构造 ----
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
+        # floor 对所有行相同（同一请求），= 尾段第一行的绝对位置。
         floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
+    # ---- 多请求：一次 H2D 拿三组长度，其余全在设备上推导 ----
     # One H2D copy for the three length vectors; launch count does not grow with bs.
     lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
     extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
     total = sum(tail_lens_cpu)
+    # req：每个行属于哪个请求（长度 total）。展开后天然按请求分组、组内保序。
     req = torch.repeat_interleave(
         torch.arange(len(tail_lens_cpu), device=device), tail_lens, output_size=total
     )
+    # offs：该行在【本请求组内】的偏移（0..tail_len-1）。
+    #   arange(total) - 本请求组的起始行号
+    #   起始行号 = cumsum(tail_lens) - tail_lens
     offs = (
         torch.arange(total, device=device)
         - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
     )
+    # token_indices：本请求尾段第一行的批内行号 + 组内偏移。
+    #   请求 i 的 extend 占批内行 [cumsum[i-1], cumsum[i])，
+    #   其尾段第一行 = cumsum[i] - tail_len[i]。
     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
+    # floor：本请求的绝对窗口下界 = seq_len - tail_len（同请求内所有行相同，
+    #   所以用 [req] 广播成每行）。转 int32 是因为下游 kernel 吃 int32。
     floor = (seq_lens - tail_lens)[req].to(torch.int32)
     return token_indices, tail_lens_cpu, floor
 

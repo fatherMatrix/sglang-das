@@ -2371,17 +2371,33 @@ class DeepseekV4AttnBackend(
         ------------------------------------------------------------------
         Q3. 前缀匹配是 page 粒度，向前扣 128 个 token 会破坏这一点吗？
         ------------------------------------------------------------------
-        不会，因为**前缀匹配本来就不是 page 粒度**：
-          RadixKey(token_ids, limit=key_limit) 是 token 序列（radix trie），
-          命中长度可以是任意 token 数，从来不是页对齐的。
-        页粒度只出现在三个别的地方，且都与"命中长度"解耦：
-          · KV 分配：整页分配，但 alloc_extend 支持从半页续写
-            （last_loc 指向该请求已占用的最后一个 slot，只补新页）
-          · SWA/full 池的 segment 释放：按页对齐回收，末尾整页释放
-          · PD 传输 / LayerSplit 选页：按页搬，边界页整页搬（over-fetch 无害）
-        所以扣 128 只是把命中长度从"某个非对齐值"变成"另一个非对齐值"，
-        不引入新的对齐问题；唯一实际代价是那 128 个 token 要重新分配 slot，
-        可能在边界多用一页——而静态选页的上界里正好有 +1 的边界余量。
+        不会。关键是**顺序**：先减 128、再页对齐，两步都作用在 key 上，
+        不会互相破坏：
+
+          ① _req_radix_key 先设上限（只改 limit 字段，不复制 token）
+                 limit = len(token_ids) - reprefill_tail
+             RadixKey.__len__ = min(limit, len(token_ids)) → 有效长度变短。
+          ② match_prefix 再做页对齐（radix_cache.py）
+                 key = key.page_aligned(self.page_size)
+                 aligned_len = len(self) // page_size * page_size
+             对齐作用在【已经减过的】长度上 → 结果仍是 page_size 的整数倍。
+          ③ match_at 的返回值同样向下取整到 page_size；
+             trie 的 child_key 也是按 page_size 个 token 建键，
+             所以树里节点的边界天生就是页对齐的。
+
+        于是：
+             命中长度   = floor((L - 128) / page_size) * page_size
+             重算 token = L - 命中长度 ∈ [128, 128 + page_size)
+                        （page_size=256 时是 128..383，多出来的是对齐取整吃掉的）
+
+        ★ 所以"扣 128"不是把页对齐破坏掉，而是**压低上限之后再向下对齐**；
+          真正的代价是重算的 token 数会比 128 略多（最多多 page_size-1），
+          而不是"命中长度变成任意值"。
+
+        补充：radix 的 page_size 就是 KV 池的 page_size（CacheInitParams.page_size），
+        所以命中长度天然是整页的，分配时不需要处理"半页共享前缀"。
+        例外是 chunked prefill 的续块：那时 prefix_len 来自 seq_len - extend_len，
+        不经过 radix 匹配，可以非对齐 —— 所以 alloc_extend 仍需支持半页续写。
 
         正确性后果（upstream #41303 的由来）：
           晚层的 SWA KV 只有尾行被写。若前缀被别的请求复用、且复用边界不在

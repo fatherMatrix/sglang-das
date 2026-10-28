@@ -91,6 +91,14 @@ class DeepseekV41Config(DeepseekV3Config):
     # V3 accepts the V4.1 compression ratios; the native V4 config rejects 1/2.
     model_type = "deepseek_v41"
     vision_n_layers = 0
+    # ★ V4.1 与 V4 Pro 的分叉点（V4 Pro 该字段默认 False）。
+    # 为 True 带来两个连锁效果：
+    #   1) DecoderLayer 构造时把 use_fused_mhc_post_pre 强制置 False
+    #      —— 跨层融合与"同子层 pre-mix"语义冲突；
+    #   2) 模型层不走 DecoderLayer.forward，改走
+    #      DecoderLayer.forward_hc_pre_from_prev，
+    #      用 mhc.HcState 把上一层的 pre-mix 直接交给下一层。
+    # 读 forward 代码时务必先看这个开关，否则会追到一条 V4.1 根本不会执行的分支。
     hc_pre_from_prev_sublayer = True
     q_head_norm = False
     kv_source_layer_ids = ()

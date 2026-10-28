@@ -3498,6 +3498,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         # 【块 0】本层是否启用跨层 mHC 融合。
         #   融合时：上一层的 hc_post 与本层的 hc_pre 合成一次 kernel，
         #   并把状态 (residual, post, comb) 延迟给下一层消费（见块 5）。
+        #   ★ V4.1 不看本分支：DeepseekV41Config 固定 hc_pre_from_prev_sublayer=True，
+        #     构造时把 use_fused 强制置 False，且模型层改走
+        #     DecoderLayer.forward_hc_pre_from_prev（不是本函数）。
+        #     因此本节及以下所有 use_fused 分支，对 V4.1 都是死代码，
+        #     它们服务的是 V4 Pro / 其他 eager 路径。
         use_fused = self.use_fused_mhc_post_pre
 
         # 【块 1】注意力之前的 mHC 边界（融合路径）。
@@ -3704,9 +3709,27 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids_global: torch.Tensor,
         seam_open: bool = True,
     ) -> mhc.HcState:
-        """The layer's two hyper-connections, each collapsing with the previous one's
+        """★ V4.1 真正走的层实现（eager ``forward`` 只服务 V4 Pro 等路径）。
+
+        The layer's two hyper-connections, each collapsing with the previous one's
         pre-mix. ``seam_open`` is False when the late-layer tail narrows the rows after
-        this layer, so nothing precomputed for the next one would still describe it."""
+        this layer, so nothing precomputed for the next one would still describe it.
+
+        为什么 V4.1 走这条而不是 ``forward``：
+          DeepseekV41Config 把 hc_pre_from_prev_sublayer 写死为 True（V4 Pro 默认
+          False）。该配置有两个连锁效果：
+            1. 构造时把 use_fused_mhc_post_pre 强制置 False（融合边界与
+               "同子层 pre-mix" 的语义冲突），所以 ``forward`` 里的融合分支
+               对 V4.1 是死代码；
+            2. 模型层因此改走本方法——它不返回 (hidden, residual, post, comb)，
+               而是用 mhc.HcState 把"上一层的 pre-mix 结果"直接交给下一层，
+               两个子层（attn / ffn）各折叠一次。
+
+        结构：两个内部函数 + 顺序调用
+          run_attn_hc ：combine(pre) → 注意力 → run_attn_post（产生下一个 pre）
+          run_ffn_hc  ：combine(pre) → MoE   → run_moe_post （产生下一个 pre）
+        注意 seam_open=False 时不给下一层预算 pre——因为晚层尾段会把行数收窄，
+        预先算好的 pre 就不再描述这些行。"""
         self._init_boundaries()
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
@@ -4477,12 +4500,22 @@ class DeepseekV4Model(nn.Module):
         dspark_aux_hidden_states: AuxHiddenStateAccumulator,
         dspark_layers_to_capture: Optional[List[int]],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
+        # 【块 1】约束：本路径不支持 PP。原因是 mHC 的 pre-mix 状态要在层间原样传递，
+        #   跨 PP stage 的 IPC 目前没有把它序列化的协议。
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
+        # 【块 2】是否处于 prefill CP 的 extend。
+        #   HCU 用 dsa_use_prefill_cp（legacy 元数据），其他平台用 is_cp_active（策略 CP）。
+        #   该标志决定 engram 哈希要不要按"全序列算完再取本 rank 行"处理。
         cp_extend = (
             (dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch))
             and forward_batch.forward_mode.is_extend()
         )
+        # 【块 3】Engram（n-gram 哈希记忆）的输入准备。
+        #   n-gram 哈希需要每个 token 的"前驱"，所以 CP 下必须先用全序列算哈希、
+        #   再按 (rank, cp_size) 步长取本 rank 的行——不能只拿本地 token 算，
+        #   否则跨 rank 边界的那几个 n-gram 会算错。
+        #   末尾按 hidden 行数补零（执行 padding 行）。
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
@@ -4518,6 +4551,13 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+        # 【块 4】decoder bounded replay 的分支：决定本次层循环跑到哪一层、
+        #   以及是否要在中途把行数切换到"尾段"。
+        #     · 未开 replay        → end_layer = 全部层，tail = None
+        #     · 开了且在跑中段 chunk → attn_backend.skip_late_layers 为真，
+        #                             直接不跑晚层（这些行没人读）
+        #     · 开了且是最后一段    → 取 late_layer_tail，到 late_layer_start 时切行
+        #   进入前先调 _check_late_layer_tail_readers 做正确性护栏。
         tail = None
         end_layer = self.end_layer
         if (
@@ -4532,13 +4572,26 @@ class DeepseekV4Model(nn.Module):
                 _log_mid_chunk_decoder_skip_once(end_layer)
             else:
                 tail = attn_backend.tail_forward_metadata.late_layer_tail
+        # 【块 5】mHC 状态初始化。
+        #   HcState 携带 residual 与"上一层的 pre-mix"；本路径的层不返回元组，
+        #   而是返回新的 HcState，从而把 pre 直接交给下一层。
+        #   assert not sp_active：mHC 假设每 rank 持有完整 token 行。
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
+        # 【块 6】层循环主体。每轮四件事，顺序不能变：
+        #   ① 尾段切换（块 7）② engram 注入（块 8）③ DSpark 捕获（块 9）
+        #   ④ 执行本层（块 10/11/12）
+        #   注意 ②③ 必须在本层执行之前：它们读的是"本层输入"而不是输出。
         for i in range(self.start_layer, end_layer):
+            # 【块 7】进入晚层的切换点：把整个批从"全序列行"收窄成"每请求尾段行"。
+            #   state / input_ids / positions / hash_ids 全部按 tail.rows 取行；
+            #   saved_full 保存原状，循环结束后由 exit_late_layer_tail 还原。
+            #   ★ 这一步是 bounded replay 的实质：晚层只算这 128 行，
+            #     因此晚层的 SWA KV 也只有这些行被写。
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4550,6 +4603,9 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+            # 【块 8】Engram 注入：把 n-gram 记忆加进残差（只在本层配置了 engram 时）。
+            #   V4.1 的多模态特例：图像占位 token 保留 engram 之前的值。
+            #   尾段模式下不需要额外取行——此处 state 已是尾段。
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4572,18 +4628,27 @@ class DeepseekV4Model(nn.Module):
                         hidden_states,
                     )
                 state = state.with_residual(hidden_states)
+            # 【块 9】DSpark 捕获点（V4.1 的真实位置）。
+            #   捕获的是"本层的注意力输入"——即 state.residual，在 combine/pre 之后、
+            #   注意力之前，不是层输出。draft 模型据此在这些层上起草。
+            #   若本层在尾段之前，捕获要先按 tail 取行，保证与后续读取的行序一致；
+            #   这也解释了为什么 mid-chunk 跳过晚层时，捕获列表仍要在循环外补齐。
             if capture_dspark and i in dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
                 dspark_aux_hidden_states.append(aux.mean(dim=1))
+            # 【块 10】层执行上下文：图路径下不加专家分布记录（捕获期不能插观测），
+            #   否则记录当前层号。
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
+                # 【块 11】HIP 专用快路径：一层内的 mHC 边界被融进单个 kernel。
+                #   与块 12 语义等价，只是省掉多次 kernel 启动。
                 if _is_hip and self.layers[i].hc_boundary_fused:
                     state = _hip.forward_layer_fused_boundary(
                         self,
@@ -4596,6 +4661,9 @@ class DeepseekV4Model(nn.Module):
                         capture_dspark=capture_dspark,
                     )
                     continue
+                # 【块 12】常规路径：带"上一层的 pre-mix"跑本层（见 DecoderLayer.forward_hc_pre_from_prev）。
+                #   seam_open 与尾段相关：尾段切换发生在下一层时，不预先算下一层的 pre。
+                #   这里是注意力与 MoE 的真正入口，KV 读写全部发生在这一层调用内部。
                 state = self.layers[i].forward_hc_pre_from_prev(
                     positions=positions,
                     state=state,
@@ -4605,6 +4673,9 @@ class DeepseekV4Model(nn.Module):
                     seam_open=tail is None,
                 )
         # The last run layer may have deferred its post to the next one.
+        # 【块 13】收尾物化：最后一层可能把 hc_post 延迟了，这里补完。
+        #   若因 mid-chunk 只跑了前半段层，DSpark 仍需把列表补齐（用当前 residual），
+        #   因为捕获列表必须完整，否则 draft 侧会缺层。
         state = state.materialized(self.layers[end_layer - 1].hc_cfg)
         if end_layer < self.end_layer and capture_dspark:
             # Keep the capture list whole; these rows precede every SWA window
@@ -4612,6 +4683,8 @@ class DeepseekV4Model(nn.Module):
             for i in sorted(dspark_layers_to_capture):
                 if i >= end_layer:
                     dspark_aux_hidden_states.append(state.residual.mean(dim=1))
+        # 【块 14】退出尾段并返回：还原 forward_batch 的全序列视图，
+        #   返回 (residual, pre, tail)。pre 供模型层用 hc_combine 算出最终 hidden。
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
@@ -4936,11 +5009,17 @@ class DeepseekV4Model(nn.Module):
             )
         last_pre = None
         tail = None
-        # 【块 5】层循环三选一：
+        # 【块 5】层循环三选一（由模型配置决定，不是运行时开关）：
         #   · hc_pre_from_prev_sublayer：跨子层复用的 mHC 方案（不支持 TBO）
+        #       ★ V4.1 Flash 恒走这条：DeepseekV41Config 写死该字段为 True。
+        #         实际执行体是 _forward_layers_hc_pre_from_prev →
+        #         DecoderLayer.forward_hc_pre_from_prev。
         #   · run_tbo                  ：two-batch-overlap，逐层自包含、无跨层融合
+        #       仅 V4 Pro 等 hc_pre_from_prev_sublayer=False 的配置可达。
         #   · 否则                      ：常规 eager 循环（含跨层 mHC 融合）
-        #   三个分支调用同一个 DecoderLayer.forward，差别只在 mHC 边界怎么组织。
+        #       调 DecoderLayer.forward，V4 Pro 走这条。
+        #   注意三个分支并不都调用 DecoderLayer.forward：V4.1 走的是另一个方法，
+        #   所以读 V4.1 代码时不要顺着 forward 往下追。
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
             hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
@@ -4954,6 +5033,8 @@ class DeepseekV4Model(nn.Module):
                 dspark_layers_to_capture,
             )
         # 【块 5'】TBO 路径：层内自包含，不做跨层 mHC 融合，所以没有尾部的 hc_post。
+    #   对 V4.1 不可达：第一条分支已被配置选中，而它 assert not run_tbo，
+    #   即"V4.1 + TBO"是一个未接线的组合（开了会直接断言失败）。
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -4976,8 +5057,10 @@ class DeepseekV4Model(nn.Module):
             #    staging + 广播（见 cp_cache_layer_split/deepseek_v4_pool.py）。
             #    本循环对 LS 是透明的。
             #
-            #    DSpark 的捕获也在这里：命中的层把 hc_post 之后的 hidden
-            #    取 mean 存进 pd_aux_hidden_states，供 draft 模型使用。
+            #    DSpark 的捕获也在这里（仅 eager 路径）：命中的层把 hc_post
+            #    之后的 hidden 取 mean 存进 pd_aux_hidden_states。
+            #    ★ V4.1 不走这条循环，它的捕获点是"目标层的注意力输入"
+            #      （见 _forward_layers_hc_pre_from_prev 的块 9）。
             # ----------------------------------------------------------
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]

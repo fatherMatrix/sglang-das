@@ -1603,6 +1603,17 @@ class DeepseekV4AttnBackend(
             get_exec().features.enable_decoder_swa_bounded_replay
         )
         # The model switches onto this metadata in enter_late_layer_tail.
+        #
+        # 【tail_forward_metadata 的生命周期】三个赋值点，别只看到 None 就以为它一直是空：
+        #   ① 这里：初始化为 None（进程级默认"没有尾段"）
+        #   ② init_forward_metadata()：每个 forward 前重建一次，三条件不满足则置 None
+        #        enable_decoder_swa_bounded_replay
+        #        and forward_mode.is_extend_without_speculative()
+        #        and not skip_late_layers
+        #   ③ convert_late_layer_tail_to_hcu_cp()：CP 切分之后用 legacy_cp=True
+        #        重建一次并【整体替换】（块 B ④ 调用）
+        # 运行期 enter_late_layer_tail() 只是把 self.forward_metadata 切成它
+        # （exit 时还原 forward_metadata），不会把它置空；下一次 forward 由 ② 覆盖。
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         # Per forward: the model stops at the last kv_source layer (see
         # _skips_late_layers), and no tail metadata is built.
@@ -3126,6 +3137,19 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.skip_late_layers = self._skips_late_layers(forward_batch)
+        # ★ tail_forward_metadata 的【主来源】：每个 forward 在这里重建一次。
+        #   三个条件必须同时成立，否则置 None（下游就知道这一批没有尾段）：
+        #     · enable_decoder_swa_bounded_replay
+        #         功能开关（来自 exec features），关掉时整条尾段路径不存在
+        #     · forward_mode.is_extend_without_speculative()
+        #         只有真正的 prefill extend 才有"晚层只算尾行"的优化；
+        #         decode / target_verify / draft_extend 都不适用
+        #     · not skip_late_layers
+        #         mid-chunk（每个请求在这个 chunk 之后仍有 ≥ SWA_WINDOW 个
+        #         prompt token）时，晚层算出来的行没人读，直接不跑晚层，
+        #         自然也不需要尾段元数据
+        #   注意 ② 阶段 CP 还没切分，所以这里建的是【整批】版本；
+        #   CP 生效时下游会用 convert_late_layer_tail_to_hcu_cp 再转一次。
         self.tail_forward_metadata = (
             self._build_late_layer_tail_metadata(forward_batch)
             if self.enable_decoder_swa_bounded_replay

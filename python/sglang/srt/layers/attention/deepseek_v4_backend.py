@@ -2583,7 +2583,7 @@ class DeepseekV4AttnBackend(
         于是本函数就干三件事：
 
         ┌─ ① 分活 ─────────────────────────────────────────────┐
-        │ 第 i 行归 i % 8 号。本 rank 只把自己那几行拿走。     │
+        │ 行的 extend 行号 v 归 v % 8 号。本 rank 只拿自己那几行。│
         └──────────────────────────────────────────────────────┘
         ┌─ ② 补齐 ─────────────────────────────────────────────┐
         │ 只有 6 行的人补 1 行【空白行】，凑到 7 行。          │
@@ -2656,17 +2656,28 @@ class DeepseekV4AttnBackend(
         而我们要的原始顺序是"按行读"。两者之间正好差一个转置，
         gather_index 就是这个转置的地址表：
 
-            gather_index[i] = (i % 8) * 7 + (i // 8)
-                              └ 第几列 ┘   └ 第几组 ┘
-                              = 它在 B 里的格子号
+        通用定义（代码就是这么算的，不要只记下面的特例）：
 
-        代入前 16 行看得很清楚：
+            gather_index[i] = owner(token_indices[i]) * max_local
+                              + /* 该 owner 在清单里第几次出现 */
 
-            i     0   1   2    3    4    5    6    7 │ 8   9   10  11  12  13  14  15
-            gi    0   7   14   21   28   35   42   49│ 1   8   15  22  29  36  43  50
-                  └──── 各 rank 的第 1 格 ──────────┘└──── 各 rank 的第 2 格 ──────┘
+          其中 owner(v) = v % cp_size（v 是 extend 行号的值，不是 i）。
 
-        所以按 i 递增去取，就等于"先取每列第 0 格、再取每列第 1 格…"，
+        ★ 特例：当清单里的值恰好从 0 开始、且连续无缺口时（本节的单请求例子
+          就是这样，值是 0..49），owner 就等于 i % 8，于是可以写成
+
+              gather_index[i] = (i % 8) * 7 + (i // 8)      ← 仅此情形成立
+
+          代入前 16 行看得出"转置"的样子：
+
+              i     0   1   2    3    4    5    6    7 │ 8   9   10  11  12  13  14  15
+              gi    0   7   14   21   28   35   42   49│ 1   8   15  22  29  36  43  50
+                    └──── 各 rank 的第 1 格 ──────────┘└──── 各 rank 的第 2 格 ──────┘
+
+          但多请求时清单里会有缺口（请求之间的非尾行），这个简式就不再成立，
+          必须回到通用定义（下一节的多请求算例就是这种情况）。
+
+        按 i 递增去取，等于"先取每块第 0 格、再取每块第 1 格…"，
         取出来的自然是 行0 行1 行2 …
 
         ★ 它永远不指"(空)"格子：只用到第 0..counts[r]-1 格。
@@ -2675,44 +2686,64 @@ class DeepseekV4AttnBackend(
           但排法完全不同 —— 别把 local_index 拿去索引 B，或反之。
 
         ==================================================================
-        返回值：形象说明 + 形状（哪个是"每请求"、哪个是"每行"，务必看清）
+        返回值：先看一个【两请求】的例子，再说每个字段的语义与形状
         ==================================================================
+            bs = 2，tail_len = 128
+            extend_lens   = [200, 37]        ← 请求1 是短 extend
+            tail_lens     = [128, 37]        total = 165
+            token_indices = [72..199] ∪ [200..236]
+                            （两个请求的尾段，请求之间可有缺口）
+            counts        = [21,21,21,21,21,20,20,20]   ← 按【整批】聚合
+            max_local     = 21
+            pads          = [0,0,0,0,0,1,1,1]           Σpad = 3
+            padded 空间   = 8×21 = 168 = 165 + 3        ✔
 
-        ▸ cp_metadata —— 一个打包对象，里面装着上面那两张表
-             .local_index             (max_local,)  int64   我用 A 的哪 7 行
-             .gather_index            (total,)      int64   第 i 行在 B 的第几格
-             .per_rank_actual_token   [7,7,7,7,7,7,7,7]     每块长度（形状对齐）
-             .per_rank_logical_token  [7,7,6,6,6,6,6,6]     真实行数（MoE 计数用）
-             .total_seq_lens          50                    真实行总数
+        ★ 关键：counts / max_local / pad_rows 都是【整批聚合】后的结果，
+          不是"每请求"的量；整批里只有 local_lens 是每请求一个数。
 
-        ▸ local_token_indices —— "这 7 行在【我自己的 extend】里排第几"
-             形状 (counts[cp_rank],) int64 —— 本例 rank2 是 (6,)
-             ★ 不补零：只含真实行，长度 = max_local - pad_rows
+        ▸ cp_metadata —— 打包对象，装着上面那两张表
+             .local_index             (max_local,)  = (21,)    从 A 取哪 21 行
+             .gather_index            (total,)      = (165,)   第 i 行在 B 的第几格
+             .per_rank_actual_token   [21]*8                   每块长度（形状对齐）
+             .per_rank_logical_token  [21,21,21,21,21,20,20,20] 真实行数（MoE 计数）
+             .total_seq_lens          165                      真实行总数
+             ★ total_seq_lens 是 Σ尾长，不是 bs×128（本例 165 ≠ 256）
+
+        ▸ local_token_indices —— "这些行在【我自己的 extend】里排第几"
+             形状 (counts[cp_rank],) int64：rank0 是 (21,)、rank7 是 (20,)
+             ★ 不补零，长度 = max_local - pad_rows
              公式 (global_row - cp_rank) // cp_size
-             例 rank2：全局行 [2,10,18,26,34,42] → [0,1,2,3,4,5]
-             用途 拿它去切 hidden_states（t[idx]），所以必须是索引
-             形象 我手里这叠牌的"本地编号"（不是批内编号）
+             例 rank0 → [9,10,...,29]
+                  其中 9..24 来自请求0（16 行），25..29 来自请求1（5 行）
+                rank7 → [9,10,...,28]（16 + 4 = 20 行）
+             ★ 它是【跨请求连续编号】的：请求1 的行紧接在请求0 之后，
+               不是每个请求都从 0 开始
+             用途 切 hidden_states / positions（t[idx]），所以必须是索引
 
-        ▸ local_positions —— "这 7 行在整个序列里的绝对位置"
-             形状 (max_local,) = (7,)
+        ▸ local_positions —— "这些行在整个序列里的绝对位置"
+             形状 (max_local,) = (21,)
              ★ 已补零：空白行的位置填 0
-             例 [pos(行2), pos(行10), ..., pos(行42), 0]
-             用途 晚层的 RoPE 与窗口计算 —— 它是要被读的【数据】，不是索引
-             ★ 与上一项的区别就在这：索引不补零、数据补零，
-               两者长度相差 pad_rows，别互相顶替
+             ★ 与上一项的区别：索引不补零、数据补零，长度相差 pad_rows，
+               两者不能互相顶替
+             用途 晚层 RoPE 与窗口计算 —— 它是要被读的【数据】
 
-        ▸ local_lens / local_lens_cpu —— "本 rank 在每个请求上分到几行"
-             形状 (bs,)：一个请求一个数
-             例 某请求尾长 128 → 8 个 rank 各 16 → [16]
+        ▸ local_lens / local_lens_cpu —— 唯一的"每请求"字段
+             形状 (bs,) = (2,)
+             例 rank0 → [16, 5]   （请求0 分到 16 行、请求1 分到 5 行）
+                rank7 → [16, 4]   （它整批只有 20 行）
              Σ local_lens = counts[cp_rank]
+             用途 按请求切分注意力、算每请求的局部长度
 
-        ▸ pad_rows —— 补了几行空白（int，0 .. max_local-1）
+        ▸ pad_rows —— 整批聚合后本 rank 还缺几行（int）
+             例 rank0..4 为 0，rank5..7 为 1
 
-        小抄：
-            每请求 → local_lens            (bs,)
-            每行   → local_token_indices   (counts[cp_rank],)  ← 不补零
-                     local_positions       (max_local,)        ← 补零
-            全批   → gather_index          (total,)
+        小抄（粒度 + 形状）：
+            字段                   形状                 粒度
+            local_lens             (bs,)                每请求
+            local_token_indices    (counts[cp_rank],)   每行（不补零）
+            local_positions        (max_local,)         每行（补零）
+            gather_index           (total,)             每行（全批）
+            per_rank_actual_token  [max_local]*cp_size  每 rank
         """
         cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size

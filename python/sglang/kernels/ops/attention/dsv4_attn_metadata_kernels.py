@@ -462,17 +462,42 @@ def late_layer_tail_layout(
         每行  （长度 = Σ尾长） token_indices / floor
         "行 = 一个 token"，按请求分组、组内保持原序。
 
-    ★ 算例（bs=2, tail_len=128, prefix=[5000, 0]）
-        extend_lens = [200, 50]  seq_lens = [5200, 50]
-        tail_lens   = [128, 50]  Σ = 178
-        行 0..127   : 请求0，token_indices = 72..199，  floor = 5072
-        行 128..177 : 请求1，token_indices = 200..249， floor = 0
-      注意 token_indices 是【批内 extend 行号】，不是请求内序号：
-        请求1 的 extend 排在请求0 的 200 行之后，所以它从 200 开始而不是 0。
-      而 floor 是【绝对位置】（请求 0 是 5072，请求 1 是 0）——
-      两者相差一个 prefix_len。floor 恰好等于"该请求尾段第一行的绝对位置"：
-        seq_len - tail_len
-      （请求0：5200-128 = 5072；请求1：50-50 = 0。）
+    ★ 三个返回值的形状/类型（记 total = Σ tail_lens_cpu）
+        token_indices : torch.Tensor  int64   shape (total,)  每行一个 extend 行号
+        tail_lens_cpu : list[int]             len   (bs)     每请求一个尾长
+        floor         : torch.Tensor  int32   shape (total,)  每行一个绝对位置
+
+    ★ 算例 A：单请求（快路径，bs=1）
+        prefix=5000, extend_lens=[200], seq_lens=[5200], tail_len=128
+          t = min(128,200) = 128
+          token_indices : shape (128,)  int64  = [72, 73, ..., 199]
+          tail_lens_cpu : [128]                       （len=1）
+          floor         : shape (128,)  int32  = [5072] * 128
+
+    ★ 算例 B：多请求（通用分支，bs=2）
+        prefix=[5000, 0], extend_lens=[200, 50], seq_lens=[5200, 50]
+          tail_lens_cpu = [128, 50]   →  total = 178
+          token_indices : shape (178,) int64
+              [72..199,            ← 请求0 的 128 行
+               200..249]           ← 请求1 的 50 行
+          tail_lens_cpu : [128, 50]                   （len=2）
+          floor         : shape (178,) int32
+              [5072]*128 + [0]*50
+
+    ★ 算例 C：短 extend（单请求，不补零）
+        extend_lens=[50], seq_lens=[5050], tail_len=128
+          t = min(128,50) = 50      ← 尾长就是整个 extend
+          token_indices : shape (50,) int64 = [0..49]
+          tail_lens_cpu : [50]
+          floor         : shape (50,) int32 = [5000]*50
+
+    ★ 两个易混点
+      ① token_indices 是【批内 extend 行号】，不是请求内序号：
+         算例 B 里请求1 的 extend 排在请求0 的 200 行之后，所以从 200 开始。
+      ② floor 是【绝对位置】：等于"该请求尾段第一行的绝对位置"
+           floor = seq_len - tail_len
+         （算例 B：请求0 = 5200-128 = 5072；请求1 = 50-50 = 0。）
+         所以 floor 与 token_indices 之间差一个 prefix_len，不是同一个坐标系。
 
     ★ 两个分支与代价
         单请求：arange + full，零 H2D

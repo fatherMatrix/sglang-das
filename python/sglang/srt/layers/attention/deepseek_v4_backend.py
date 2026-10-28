@@ -2315,6 +2315,39 @@ class DeepseekV4AttnBackend(
                                 每行的请求号与位置（压缩器/indexer 用）
             req_global / pos_global / global_token_indices（CP 时）
 
+          ★ 先明确「一行」是什么：**一行 = 一个 token**。
+            hidden 是 [tokens, hc_mult, hidden]，positions 是 [tokens]，
+            KV 池里每个 token 占一个 slot —— 所以"对 token 做选择"这件事，
+            在所有张量上都是"取哪些行"。这组数组就是"被选中的那些行"的清单。
+
+          ★ "按请求分组、组内保原序"说的是这个一维数组的排布：
+
+              [ 请求0 的尾行 | 请求1 的尾行 | 请求2 的尾行 | ... ]
+                每组内按 token 位置递增
+
+            例：extend = [1000, 200, 50]，SWA_WINDOW = 128
+                tail_lens = [128, 128, 50]           Σ = 306
+                行号      0..127   128..255   256..305
+                内容（token_indices，即原 extend 里的行号）：
+                  请求0 → 872..999     （1000-128 起的 128 行）
+                  请求1 → 1072..1199   （1200-128 起的 128 行）
+                  请求2 → 1200..1249   （1250-50  起的 50 行）
+
+            之所以是"拼接"而不是"二维 [bs, 128] 矩阵"：
+              · 各请求尾长不等（50 vs 128），补成矩形会产生无效行，
+                kernel 还得为它们额外做掩码；
+              · 拼接后的总行数正好是真正要算的行数，不浪费；
+              · 这正是 attention 输入的形态：一个 packed 的 token 序列，
+                请求边界由"每请求长度"（extend_seq_lens）表达，
+                与 cu_seqlens / seq_lens_casual 是同一套做法。
+
+          ★ 组内保原序的作用（不是随意约定）：
+            · 单请求时整段是连续的 → 可以用切片（view）代替 gather
+              （contiguous_start 快路径）；
+            · CP 下局部行号 (t - cp_rank) // cp_size 才成立；
+            · 尾段 all-gather 的 gather_index 才等于
+              owner_rank * max_local + 组内槽位。
+
         为什么必须"批级对象 + ragged 行"而不能"每请求一个对象"？
           attention kernel / 集合通信 / 图捕获都按【一个批一次调用】设计，
           批级对象是它们唯一的输入；per-request 的信息用"长度数组 + 拼接行"

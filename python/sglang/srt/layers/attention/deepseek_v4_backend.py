@@ -1990,6 +1990,27 @@ class DeepseekV4AttnBackend(
         #     因为这时表是先按"全局/打包空间"建好、再切给本 rank 的：
         #     尾段的 local_index 会引用到 [0, cp_size*max_local) 里的编号，
         #     缓冲若按本 rank 的行数（21）建，索引立刻越界。
+        #
+        # ★ HCU 上到底会不会进下面那个 if？—— 只有一处会进。
+        #   判据是 cp_active = (cp_metadata 显式传入) or is_cp_active(forward_batch)，
+        #   而 is_cp_active() 在 HCU 上恒为 False（enable_cp_v2() 对 HCU 返回 False），
+        #   所以 HCU 只能靠"显式传 cp_metadata"进入。逐个调用点看：
+        #
+        #     调用点                                    传 cp_metadata  HCU 上 cp_active
+        #     ─────────────────────────────────────────────────────────────────────
+        #     _build_forward_metadata（主 prefill）        否            False
+        #        → padded = out_cache_loc 长度（整批行）
+        #        → 切分在稍后的 ForCausalLM 块 B 里由 apply_cp_reindex 完成
+        #     _build_late_layer_tail_metadata 第 1 次      否            False
+        #        （runner 阶段，legacy_cp=False → cp_tail=None）
+        #        → padded = 尾行数（本例 165）
+        #     _build_late_layer_tail_metadata 第 2 次      是            True ★
+        #        （convert_late_layer_tail_to_hcu_cp，legacy_cp=True）
+        #        → padded = cp_size × max_local（本例 168 = 165 + 3 空）
+        #     DSpark draft block 元数据                    否            False
+        #
+        #   也就是说：HCU 的**主 prefill 不走这里**，但**尾段转换那一次会走**，
+        #   这正是下面这句英文注释的意思。
         padded_num_tokens = out_cache_loc.shape[0]
         # An explicit layout (decoder SWA tail) is CP too: HCU's legacy prefill CP
         # never reports is_cp_active.
@@ -1997,6 +2018,8 @@ class DeepseekV4AttnBackend(
             forward_batch is not None and is_cp_active(forward_batch)
         )
         if cp_active:
+            # 只有"策略 CP"这条会用到 forward_batch 兜底（cp_metadata 为 None
+            # 但 is_cp_active 为真）；HCU 永远从上面显式拿到 cp_metadata。
             if cp_metadata is None:
                 cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None

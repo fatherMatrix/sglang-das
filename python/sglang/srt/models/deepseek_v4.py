@@ -5681,13 +5681,49 @@ class DeepseekV4ForCausalLM(nn.Module):
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
-                    # ④ bounded replay 的尾段元数据也要转换。
-                    #   尾段是在【切分之前】按整批构造的，行集合与本 rank 不符。
-                    #   转换实现（convert_late_layer_tail_to_hcu_cp）内部用 legacy_cp=True
-                    #   重建一份尾段布局，并额外要求：
-                    #     · 必须是 round-robin（即本分支）；别的切法直接报错（见下面的 elif）
-                    #     · 必须启用 MoE A2A 后端，否则 round-robin 后的 input_ids 不是
-                    #       rank-local，尾段重建会用到错的 token（实现里直接 NotImplementedError）
+                    # ④ bounded replay 的尾段元数据也要"事后转换"。
+                    #
+                    #   【尾段是什么】
+                    #   decoder bounded replay 下，L21..L39 只算每请求最后 128 个 token。
+                    #   于是需要一份"尾段子批"的元数据：tail_forward_metadata，
+                    #   其中的 LateLayerTail 记着
+                    #     token_indices  尾行在原 extend 里的行号
+                    #     positions      这些行的绝对位置
+                    #     extend_seq_lens/… 每请求尾长
+                    #     swa_out_cache_loc SWA 写落点
+                    #     （CP 版还有 pad_rows / cp_metadata / local_lens /
+                    #       global_token_indices）
+                    #
+                    #   【为什么此时必须转换】
+                    #   这份元数据是在 runner 的 init_forward_metadata 里按【整批】建的，
+                    #   而 CP 切分发生得更晚（就在本块）。切完之后本 rank 只剩
+                    #   [r, r+cp_size, ...] 这些行，但 tail 里记的是"整批的第 100、101… 行"
+                    #   —— 那些行可能根本不归本 rank，直接拿去用会算错请求/算错位置。
+                    #
+                    #   【转换做了什么】（convert_late_layer_tail_to_hcu_cp）
+                    #   用 legacy_cp=True 重新调一次 _build_late_layer_tail_metadata：
+                    #     · owner_rank = token_indices % cp_size，算出每个尾行归谁
+                    #     · 取本 rank 的那部分（local_tail_rows）
+                    #     · 各 rank 尾行数不同，pad 到 max_local 才能参与集合通信
+                    #     · 生成 gather_index = owner_rank * max_local + slot，
+                    #       供尾段的 all-gather 还原全局尾序
+                    #     · 保留 global_token_indices（原始整批行号），
+                    #       因为 DSpark 的注入按全局 extend 索引，不用 rank-local 行号
+                    #
+                    #   【为什么不在 init 时就按 CP 建】
+                    #   因为那时还不知道这一批会不会切：attn_cp_metadata 在本块才创建，
+                    #   can_dsa_cp_split 也可能因批太短（< cp_size）而整批不切。
+                    #   不切时 tail 必须保持"整批"语义 → 只能事后按实际结果转换。
+                    #
+                    #   【两个硬前提】
+                    #     · 必须是 round-robin：gather_index 的公式隐含"行按 rank 分组、
+                    #       组内保持原顺序"的 interleave 布局；zigzag 不满足，
+                    #       所以在 elif 里直接拒绝，而不是静默用错布局。
+                    #     · 必须启用 MoE A2A 后端：见 hcu_cp_utils.cp_round_robin_input_ids
+                    #       —— a2a=none 时本 rank 持有的是【全量 token 的重排】
+                    #       （reshape(-1,cp).T.flatten()），不是 rank-local 子集；
+                    #       此时"本 rank 的尾行"这个概念不成立，重建会取到错的 token，
+                    #       所以实现里直接 NotImplementedError。
                     if getattr(attn_backend, "tail_forward_metadata", None) is not None:
                         # decoder SWA bounded replay: the tail was built before the split
                         convert = getattr(

@@ -1189,6 +1189,34 @@ class _LowRatioDenseMetadata:
 
 @dataclass
 class DSV4Metadata:
+    # ==================================================================
+    # 一次 forward 的"注意力契约总包"。里面是两类不同粒度的元数据：
+    #
+    # ① core_attn_metadata（DSV4AttnMetadata）—— "每个 token 行怎么读 KV"
+    #      按【本 rank 的 token 行】组织：
+    #        page_table        每行 = 该 token 所属请求的 KV 页号列表
+    #                          （= req_to_token[req, ::page_size] // page_size）
+    #        seq_lens_casual   每行的因果长度（该 token 在序列里的位置+1）
+    #        positions_casual  每行的绝对位置
+    #        swa_page_indices / swa_topk_lengths
+    #                          SWA 窗口要读哪些位置、窗口多长
+    #        *_out_loc         写 KV 的落点（★ 保持全局顺序，供压缩器整段写）
+    #        c1/c2/c4_sparse_* 稀疏 prefill 的 top-k 页索引缓存
+    #      → 注意力主 kernel 只读这一份。
+    #
+    # ② indexer_metadata（PagedIndexerMetadata）—— "打分要看哪些页"
+    #      描述 indexer（top-k 检索）的输入，粒度是【压缩域】：
+    #        page_table        压缩后的页表；ratio 1/2 时由 core.page_table
+    #                          经 expand_index_page_table 按 64-slot 粒度重排
+    #        compressed_seq_lens  压缩域长度（≈ceil(seq/ratio)，按请求算）
+    #        compress_ratio / rows_per_chunk / topk_metadata  打分与调度计划
+    #      → 只被 indexer 打分与 top-k 选块使用。
+    #
+    # 两者的关系：indexer 元数据是从 core 元数据【推导】出来的，不是切出来的。
+    # 所以 CP 重排时，core 的 per-token 字段可以直接按行切片（apply_cp_reindex），
+    # 而 indexer 元数据必须用 init_forward_metadata_indexer 重新构造
+    # （展开后的页号、按请求的压缩长度都随行集合变化）。
+    # ==================================================================
     core_attn_metadata: DSV4AttnMetadata
     indexer_metadata: Optional[PagedIndexerMetadata]
 

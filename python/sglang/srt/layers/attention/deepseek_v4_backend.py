@@ -2185,6 +2185,37 @@ class DeepseekV4AttnBackend(
           在 a2a=none 下，hidden 仍被 cp_split_and_rebuild_data 切成 N/cp，
           而 input_ids 保持全量 —— 两者长度本身就不一致，说明这条组合不是
           一条自洽的路径。本函数的 NotImplementedError 拦的正是它。
+
+        ==================================================================
+        【在整个生命周期里的位置】—— 把 tail_forward_metadata 的三处赋值串起来
+        ==================================================================
+
+            __init__
+                tail_forward_metadata = None            （进程级默认：没有尾段）
+                        ↓
+            runner: init_forward_metadata(forward_batch)   ← 每 forward 一次
+                三条件同时成立才建【整批】尾段：
+                  enable_decoder_swa_bounded_replay
+                  and is_extend_without_speculative()
+                  and not skip_late_layers
+                ★ 此刻 CP 还没切分 → 行号是【整批 extend】的行号
+                        ↓
+            模型层 ForCausalLM.forward 的块 B（CP 切分已经判定完）
+                ④ 本函数：用 legacy_cp=True 重建 → 替换成【rank-local】尾段
+                ★ 只有 CP round-robin + 这批真的切了，才有必要走到这里；
+                  非 CP 时 tail 保持 ② 建的那份，本函数不会被调用
+                        ↓
+            层循环（_forward_layers_hc_pre_from_prev）
+                走到 late_layer_start 时 enter_late_layer_tail：
+                    self.forward_metadata      = tail_forward_metadata
+                    forward_batch.attn_cp_metadata = tail.cp_metadata
+                    LayerSplit 池 reset_batch_active_pages()（尾段读的是别的行）
+                        ↓
+                尾段跑完 exit_late_layer_tail：还原 forward_metadata
+                （tail_forward_metadata 本身保留，不清空）
+                        ↓
+            下一次 forward 的 init_forward_metadata → 覆盖重建，回到顶部
+        ==================================================================
         """
         # 没开 bounded replay（或这一批没建尾段）→ 没有东西要转换。
         # tail_forward_metadata 是批级的：一个 forward 一份，None 表示这一批

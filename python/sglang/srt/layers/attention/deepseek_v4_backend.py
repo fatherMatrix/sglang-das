@@ -2175,15 +2175,42 @@ class DeepseekV4AttnBackend(
           而 input_ids 保持全量 —— 两者长度本身就不一致，说明这条组合不是
           一条自洽的路径。本函数的 NotImplementedError 拦的正是它。
         """
+        # 没开 bounded replay（或这一批没建尾段）→ 没有东西要转换。
+        # tail_forward_metadata 是批级的：一个 forward 一份，None 表示这一批
+        # 晚层不走 tail 路径（例如 decode、或 skip_late_layers 的 mid-chunk）。
         if self.tail_forward_metadata is None:
             return
         from sglang.srt.layers.moe import get_moe_a2a_backend
 
+        # 前提校验，理由见上面 docstring 的两形态对比：
+        #   a2a 存在 → input_ids 是 rank-local 子集，尾段可寻址
+        #   a2a 缺失 → input_ids 是全量重排，"本 rank 的尾行"不成立
         if get_moe_a2a_backend().is_none():
             raise NotImplementedError(
                 "decoder SWA bounded replay under HCU prefill CP needs an MoE A2A "
                 "backend: without one the round-robin input ids are not rank-local"
             )
+        # 重建并【整体替换】旧的整批版本（旧对象直接丢弃，不做原地改）。
+        #
+        # legacy_cp=True 是这里的要害：
+        #   _build_late_layer_tail_metadata 内部只在
+        #       `legacy_cp or is_cp_active(forward_batch)`
+        #   成立时才走 _late_layer_tail_cp_layout（即 CP 布局）。
+        #   而 HCU 的策略 CP 未启用，is_cp_active() 恒为 False；不显式传
+        #   legacy_cp=True 的话，尾段会被当成"非 CP"重新建一遍，
+        #   仍然按整批行号，等于白做。
+        #
+        # 重建后的结构（见 _late_layer_tail_cp_layout）：
+        #   cp_metadata        InterleaveContextParallelMetadata
+        #                      （per_rank_actual_token / max_rank_len /
+        #                        per_rank_logical_token / gather_index / local_index）
+        #   token_indices      (token_indices[local] - cp_rank) // cp_size
+        #                      → 全局 extend 行号换算成本 rank 的局部行号
+        #   positions          本 rank 尾行的位置（不足处补 0）
+        #   pad_rows           max_local - 本 rank 尾行数（集合通信需等长）
+        #   local_lens(_cpu)   本 rank 每请求的尾行数
+        #   global_token_indices / req_global / pos_global
+        #                      保留全局行号，供 DSpark 注入与压缩器使用
         self.tail_forward_metadata = self._build_late_layer_tail_metadata(
             forward_batch, legacy_cp=True
         )

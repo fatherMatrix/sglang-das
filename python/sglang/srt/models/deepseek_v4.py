@@ -5576,6 +5576,18 @@ class DeepseekV4ForCausalLM(nn.Module):
         #   内部的层循环。两者是同一次 forward 的两段，不是二选一。
         if not enable_cp_v2() and self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                # 【块 B-1】生成 CP 元数据对象。
+                #   ★ 注意 round-robin 模式下它返回的是一个【空对象】
+                #     （hcu_cp_utils.prepare_context_parallel_metadata 一进来就
+                #      `if is_dsa_prefill_cp_round_robin_split(): return ContextParallelMetadata()`）。
+                #   因为 round-robin 的归属规则自带：token t 归 rank t % cp_size，
+                #   不需要 per-request 的切分表。只有 zigzag（in-seq-split）才需要填内容。
+                #   这解释了为什么后面很多地方要判 `attn_cp_metadata.total_seq_lens` 为 0。
+                #
+                #   另一件关键事：
+                #   attn_backend.forward_metadata 是【进模型之前】由 runner 的
+                #   init_forward_metadata() 按【整批未切分】建好的。所以这一段不是
+                #   "新建元数据"，而是【就地改造】成"本 rank 视角"。顺序不能颠倒。
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
@@ -5583,16 +5595,43 @@ class DeepseekV4ForCausalLM(nn.Module):
                     forward_batch.seq_lens_cpu.tolist(),
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
+                # 【块 B-2】round-robin 专用改造（HCU 生产走这条）。
+                #   下面四步有严格先后：
+                #     ① apply_cp_reindex      按 rank 步长切 per-token 字段
+                #     ② init_flashmla_related  按【切分后】的行数重建派生缓冲区
+                #     ③ 重建 indexer 元数据     压缩域页表要重新推导
+                #     ④ 转换尾段元数据         bounded replay 的 tail 也要按本 rank 行重算
+                #   ①② 顺序反了会让派生缓冲区按整批行数分配、却只被写 1/cp_size 行。
                 if is_dsa_prefill_cp_round_robin_split():
                     attn_backend = get_attn_backend()
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
+                    # ① 就地切片：per-token 字段按 slice(rank, None, cp_size) 取行
+                    #     （seq_lens_casual / positions_casual / swa_page_indices /
+                    #       swa_topk_lengths / page_table）。
+                    #   而写 KV 的落点（*_out_loc）【故意不切】：压缩器要按全局 token 顺序
+                    #   写整段压缩状态（每个 rank 各写一份），切了就会写错位置。
                     core_meta.apply_cp_reindex()
+                    # ② 重建稀疏 prefill 的派生缓冲区。
+                    #   它按 topk_lengths.size(0)（= 当前行数）分配 sparse_page_indices，
+                    #   并额外开一份 raw_indices 供 prefill 用。
+                    #   ★ 必须在 ① 之后：否则尺寸按整批算，与本 rank 的行数不符。
                     core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
+                        # ③ 重建 indexer 元数据（不是切片）。
+                        #   因为它的 page_table 是 core 页表经 expand_index_page_table
+                        #   按 64-slot 粒度展开的，compressed_seq_lens 又是按请求算的压缩长度，
+                        #   两者都随行集合变化 → 只能用新的 core_meta 重新构造。
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
+                    # ④ bounded replay 的尾段元数据也要转换。
+                    #   尾段是在【切分之前】按整批构造的，行集合与本 rank 不符。
+                    #   转换实现（convert_late_layer_tail_to_hcu_cp）内部用 legacy_cp=True
+                    #   重建一份尾段布局，并额外要求：
+                    #     · 必须是 round-robin（即本分支）；别的切法直接报错（见下面的 elif）
+                    #     · 必须启用 MoE A2A 后端，否则 round-robin 后的 input_ids 不是
+                    #       rank-local，尾段重建会用到错的 token（实现里直接 NotImplementedError）
                     if getattr(attn_backend, "tail_forward_metadata", None) is not None:
                         # decoder SWA bounded replay: the tail was built before the split
                         convert = getattr(
@@ -5604,6 +5643,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 f"not wired for {type(attn_backend).__name__}"
                             )
                         convert(forward_batch)
+                # ⑤ 非 round-robin 切法 + 开了 bounded replay → 明确拒绝。
+                #   宁可启动期/首请求就炸，也不要静默用错误的尾段布局算出错误结果。
                 elif (
                     getattr(get_attn_backend(), "tail_forward_metadata", None)
                     is not None

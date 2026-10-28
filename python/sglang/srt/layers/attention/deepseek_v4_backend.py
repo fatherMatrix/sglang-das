@@ -2138,6 +2138,42 @@ class DeepseekV4AttnBackend(
         init_forward_metadata built the tail over the whole extend. Its split is the
         interleave layout (token t on rank t % cp_size at local row t // cp_size), so
         the tail takes the CP-v2 layout; the HCU all-gather reads its gather_index.
+
+        ==================================================================
+        ★ 为什么"有没有 MoE A2A 后端"决定了这里能不能做（不是保守判断）
+        ==================================================================
+
+        同一个 CP 切分，两种 MoE 形态下"本 rank 手里到底有哪些 token"完全不同，
+        而尾段重建的全部推导都建立在"本 rank 只持有 t % cp_size == rank 的那些行"
+        这个前提上。
+
+        【a2a 存在（DeepEP / EP）】
+          hcu_cp_utils.cp_round_robin_input_ids → input_ids[cp_rank::cp_size]
+          → 本 rank 的 input_ids 与 hidden 等长（都是 N/cp），且行序就是
+            "组内保持原序"。
+          于是尾段可以按 owner_rank = token_indices % cp_size 选行、
+          按 max_local 补 pad，再用 gather_index = owner*max_local + slot
+          把 rank-major 的行映射回全局尾序。
+          （hcu_cp_utils.py 里 all-gather 的注释也写明：
+            "ranks hold uneven, padded shares, so map the rank-major rows
+             straight to global tail order" —— 与这里的 gather_index 配套。）
+
+        【a2a 不存在（TP MoE）】
+          cp_round_robin_input_ids → input_ids.reshape(-1, cp_size).T.flatten()
+          → 拿回来的是【全量 token 的重排】（docstring 写的是
+            "rank0~7: 0,8,16,...,1,9,17,...,2,10,18,..."），不是 rank-local 子集。
+          原因：TP MoE 每个 rank 要算所有 token 的专家分片，注意力段之后要把
+          hidden all-gather 成全量，MoE 才能工作；input_ids 必须按 all-gather
+          后的行序重排才能与之对齐。
+          此时"本 rank 的尾行"不再是一个可独立寻址的集合：
+            · token_indices 里的整批行号无法直接索引这份重排后的数组；
+            · 各 rank 尾行数不等、需要 pad 的前提也不成立。
+          所以正确做法是拒绝，而不是算出一个看似合理但错位的结果。
+
+        【一句补充】
+          在 a2a=none 下，hidden 仍被 cp_split_and_rebuild_data 切成 N/cp，
+          而 input_ids 保持全量 —— 两者长度本身就不一致，说明这条组合不是
+          一条自洽的路径。本函数的 NotImplementedError 拦的正是它。
         """
         if self.tail_forward_metadata is None:
             return

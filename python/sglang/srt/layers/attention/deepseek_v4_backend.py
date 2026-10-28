@@ -2686,28 +2686,48 @@ class DeepseekV4AttnBackend(
           但排法完全不同 —— 别把 local_index 拿去索引 B，或反之。
 
         ==================================================================
-        返回值：先看一个【两请求】的例子，再说每个字段的语义与形状
+        返回值：先看一个【两请求】的例子，再把每个字段逐个说清
         ==================================================================
             bs = 2，tail_len = 128
             extend_lens   = [200, 37]        ← 请求1 是短 extend
             tail_lens     = [128, 37]        total = 165
             token_indices = [72..199] ∪ [200..236]
                             （两个请求的尾段，请求之间可有缺口）
-            counts        = [21,21,21,21,21,20,20,20]   ← 按【整批】聚合
-            max_local     = 21
-            pads          = [0,0,0,0,0,1,1,1]           Σpad = 3
-            padded 空间   = 8×21 = 168 = 165 + 3        ✔
 
-        ★ 关键：counts / max_local / pad_rows 都是【整批聚合】后的结果，
-          不是"每请求"的量；整批里只有 local_lens 是每请求一个数。
+        ── 先把这笔账算清楚：165 行分给 8 个 rank ────────────────────
+            165 ÷ 8 = 20 余 5
+              → 前 5 个 rank 各得 21 行，后 3 个各得 20 行
+                  counts[r]      = [21,21,21,21,21,20,20,20]   各人实得
+                  max_local      = 21                          统一标准（人人按 21 算）
+                  pads[r]        = max_local - counts[r]
+                                 = [0,0,0,0,0,1,1,1]           各人缺几行
+                  Σpad           = 3                           共补 3 行空白
+                  padded 空间    = 8×21 = 168 = 165 + 3        等长缓冲的总格数
 
-        ▸ cp_metadata —— 打包对象，装着上面那两张表
-             .local_index             (max_local,)  = (21,)    从 A 取哪 21 行
-             .gather_index            (total,)      = (165,)   第 i 行在 B 的第几格
-             .per_rank_actual_token   [21]*8                   每块长度（形状对齐）
-             .per_rank_logical_token  [21,21,21,21,21,20,20,20] 真实行数（MoE 计数）
-             .total_seq_lens          165                      真实行总数
-             ★ total_seq_lens 是 Σ尾长，不是 bs×128（本例 165 ≠ 256）
+        ★ 这四个数都是【整批聚合】的结果，不是"每请求"的量。
+          整批里只有 local_lens 是每请求一个数（见下）。
+
+        ▸ cp_metadata —— 一个对象，把两张表 + 三个尺寸参数打包给下游。
+          逐项看"谁读它、读了干什么"：
+
+            字段                      本例取值                  谁读              用途
+            ─────────────────────────────────────────────────────────────────────
+            .local_index              (21,) int64               apply_cp_reindex  我取 A 的哪 21 行
+            .gather_index             (165,) int64              尾段 all-gather   第 i 行在 B 的第几格
+            .per_rank_actual_token    [21]*8                    集合通信          每块统一 21 行
+            .per_rank_logical_token   [21,21,21,21,21,20,20,20] MoE token 计数    真实行数
+            .total_seq_lens           165                       日志/元数据       真实行总数
+
+          ★ actual 与 logical 必须分开，别混用：
+                actual  = 21       补齐后的统一尺寸（集合通信按它对齐）
+                logical = 20 或 21 真实行数（MoE dispatch 只该看到这些）
+             把 actual 当 logical 用 → 3 个空白行会被当真实 token 送进专家。
+
+          ★ 三个"行数"各不相同，不能互相替代：
+                165 = total_seq_lens            真实尾行数（Σ min(128, extend)）
+                168 = Σ per_rank_actual_token   补齐后行数（含 3 个空白）
+                256 = bs × tail_len             若每请求都满 128 的理论上限
+             本例请求1 只有 37 行尾段（短 extend），所以真实只有 165 行。
 
         ▸ local_token_indices —— "这些行在【我自己的 extend】里排第几"
              形状 (counts[cp_rank],) int64：rank0 是 (21,)、rank7 是 (20,)

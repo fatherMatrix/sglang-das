@@ -1955,10 +1955,31 @@ class DeepseekV4AttnBackend(
         #                 但 LS 要求 forward_batch 传进来以构造 CP 尾段布局
         #   · DSpark ：dspark_block_size / dspark_swa_buffers 参与元数据
         # ==================================================================
-        # 【块 1】确定本批的物理行数。
-        #   非 CP：就是 out_cache_loc 的长度（含执行 padding）。
-        #   CP   ：改用"各 rank 实际 token 之和"，因为切分后每 rank 行数不同，
-        #          集合通信与 KV 写入都按这个数对齐。
+        # 【块 1】padded_num_tokens = 这份元数据缓冲要建多少行。
+        #   它决定了后面 expand_prefill_casually / make_core_attn_metadata
+        #   建出来的表的长度，也就是 apply_cp_reindex 切片【之前】的长度。
+        #
+        #   三种情形，取法不同：
+        #
+        #   ① 非 CP（HCU 的 legacy round-robin 在这里也走这条：init 阶段
+        #      is_cp_active() 恒为 False）
+        #         = out_cache_loc.shape[0] = 本批【全部】query 行（未切分）
+        #         之后在 ForCausalLM 块 B 里用 apply_cp_reindex() 按步长切 1/8
+        #
+        #   ② 策略 CP（CUDA，is_cp_active 为真）
+        #         = sum(per_rank_actual_token) = 各 rank 真实 token 数之和
+        #           = 全局 token 数（各 rank 正好把 token 分完，不重复不遗漏）
+        #
+        #   ③ 尾段路径（显式传 cp_metadata，见 _build_late_layer_tail_metadata）
+        #         = sum(per_rank_actual_token) = cp_size × max_local
+        #           注意这里每 rank 报的是【补齐后】的行数（含私有空白行），
+        #           所以比真实行数多 Σpad。例：total=165、max_local=21、cp=8
+        #           → 8×21 = 168（165 真 + 3 空）
+        #
+        #   为什么 CP 下不能直接用本 rank 的 out_cache_loc 长度？
+        #     因为这时表是先按"全局/打包空间"建好、再切给本 rank 的：
+        #     尾段的 local_index 会引用到 [0, cp_size*max_local) 里的编号，
+        #     缓冲若按本 rank 的行数（21）建，索引立刻越界。
         padded_num_tokens = out_cache_loc.shape[0]
         # An explicit layout (decoder SWA tail) is CP too: HCU's legacy prefill CP
         # never reports is_cp_active.

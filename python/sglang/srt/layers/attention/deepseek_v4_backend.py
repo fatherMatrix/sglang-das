@@ -2385,14 +2385,29 @@ class DeepseekV4AttnBackend(
              trie 的 child_key 也是按 page_size 个 token 建键，
              所以树里节点的边界天生就是页对齐的。
 
-        于是：
+        于是（记 r = L mod page_size）：
              命中长度   = floor((L - 128) / page_size) * page_size
-             重算 token = L - 命中长度 ∈ [128, 128 + page_size)
-                        （page_size=256 时是 128..383，多出来的是对齐取整吃掉的）
+             重算 token = L - 命中长度
+                        = 128 + ((L - 128) mod page_size)
+                        = r        (r >= 128)
+                          r + page_size   (r < 128)
+             取值范围 [128, 128 + page_size)
 
-        ★ 所以"扣 128"不是把页对齐破坏掉，而是**压低上限之后再向下对齐**；
-          真正的代价是重算的 token 数会比 128 略多（最多多 page_size-1），
-          而不是"命中长度变成任意值"。
+        ★ 所以扣 128 之后重算量是 128..383（page_size=256），
+          比 128 最多多出 page_size-1 = 255 个 token —— 用户的直觉是对的。
+
+        ★ 换个基准看更清楚：**不开这个 hold-back 时，页对齐本身就已经让
+          L mod page_size 个 token 无法命中**（key 是对齐过的）。所以 hold-back
+          相对无 hold-back 的额外代价只有两种情形：
+             r >= 128 → 完全没多算（重算仍是 r）
+             r <  128 → 恰好多算一整页（page_size）
+          也就是说它不会"多算一点点"，要么 0、要么一整页。
+
+        ★ 这个顺序（先减 128、再对齐）是**最优**的：约束是"命中长度必须是
+          page_size 的倍数、且 <= L-128"，满足它的最大值正是
+          floor((L-128)/page_size)*page_size。任何别的顺序都更差，例如：
+            · 先对齐再减 128 → (floor(L/ps)-1)*ps → 重算 256..511
+            · 把 hold-back 设成一整页（ps）→ 重算 256..511
 
         补充：radix 的 page_size 就是 KV 池的 page_size（CacheInitParams.page_size），
         所以命中长度天然是整页的，分配时不需要处理"半页共享前缀"。

@@ -1087,6 +1087,16 @@ class DSV4AttnMetadata:
         #   用 seq_lens_casual 的行数而不是 forward_batch 的 token 数：它是 per-token
         #   字段，行数就代表这份元数据"认"的行数（含执行 padding）。
         #   后面的整除断言、期望行数都以它为准。
+        #
+        #   ★ shape[0] 是什么：张量的 .shape 是一个元组，shape[0] 就是【第 0 维】
+        #     （行数）：
+        #         t = torch.zeros(3000)          → t.shape == (3000,)
+        #                                          t.shape[0] == 3000   ← 行数
+        #         p = torch.zeros(3000, 12)      → p.shape == (3000, 12)
+        #                                          p.shape[0] == 3000   ← 行数
+        #                                          p.shape[1] == 12     ← 每行 12 个元素
+        #     本例 seq_lens_casual 是一维、每 token 一个数，所以 shape[0] 就是 token 行数。
+        #     不要和 numel() 混：numel() 是所有元素总数（3000×12 = 36000）。
         pre_global_len = self.seq_lens_casual.shape[0]
         # 【2a】显式行号分支：调用方给一个 Tensor，里面是本 rank 要保留的行下标。
         #   用于"行集合不是等步长"的场景，例如尾段 CP 布局（每请求尾行数不同、

@@ -993,8 +993,22 @@ class DSV4AttnMetadata:
                 )
             )
 
+    # ------------------------------------------------------------------
+    # CP 重排的三张字段表（apply_cp_reindex 的唯一依据）
+    #
+    # 判定标准只有一条：这个字段是"按 token 行"还是"按全局地址"？
+    #   按 token 行 → 必须跟着行集合切片
+    #   按全局地址 → 一行都不能动
+    # ------------------------------------------------------------------
     # Cache-write locations stay in global logical order and are intentionally
     # excluded from CP reindexing.
+    # 【必切·读侧】每 token 一行，全部是"这一行该读什么、从哪读"：
+    #   seq_lens_casual   该 token 的因果长度（决定能看多远）
+    #   positions_casual  该 token 的绝对位置（RoPE / 窗口计算用）
+    #   swa_page_indices  SWA 窗口的起始位置索引
+    #   swa_topk_lengths  SWA 窗口实际长度（≤ SWA_WINDOW）
+    #   page_table        该 token 所属请求的 KV 页号列表（paged attention 的寻址表）
+    # 这些字段若不同步切，kernel 会拿别的 rank 的行去读 KV → 读到错请求的页。
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
         "positions_casual",
@@ -1002,6 +1016,11 @@ class DSV4AttnMetadata:
         "swa_topk_lengths",
         "page_table",
     ]
+    # 【可切·读侧】同样是 per-token，但只在模型存在对应压缩比时才有值：
+    #   c4_*    → V4 Pro 的 C4 家族（V4.1 没有，恒为 None）
+    #   c128_*  → V4 Pro 的 C128 家族（V4.1 没有，恒为 None）
+    #   c1_* / c2_* → V4.1 Flash 的低压缩比家族（ratio 1 / 2）
+    # 因为 None 是合法的，apply_cp_reindex 允许这些字段缺失并跳过。
     # Same treatment, None for models without that compress ratio.
     _CP_REINDEX_OPTIONAL_FIELDS = [
         "c4_topk_lengths_raw",
@@ -1011,6 +1030,15 @@ class DSV4AttnMetadata:
         "c1_topk_lengths_clamp1",
         "c2_topk_lengths_clamp1",
     ]
+    # 【不切·写侧】这些不是"读哪里"，而是"写到哪里"——池里的全局 slot 地址：
+    #   raw_out_loc        本批 token 的原始写入位置
+    #   swa_out_cache_loc  SWA 空间的写入位置
+    #   c4/c128/c1/c2_out_loc  各压缩家族的写入位置
+    #
+    # 为什么不能切：压缩器要按【全局 token 顺序】把整段压缩状态写出来，
+    # 每个 CP rank 各写一份完整副本（所以 CP 本身并不省 KV）。
+    # 一旦按 rank 切了这些落点，写入位置就与 token 的真实顺序脱钩。
+    # apply_cp_reindex 对它们只做一件事：断言行数仍等于全局 token 数。
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
         "swa_out_cache_loc",
@@ -1025,9 +1053,44 @@ class DSV4AttnMetadata:
         num_tokens: Optional[int] = None,
         local_index: Optional[torch.Tensor] = None,
     ) -> None:
+        # ==================================================================
+        # apply_cp_reindex —— 把"整批视角"的注意力元数据就地改造成"本 rank 视角"
+        #
+        # 【为什么需要】
+        #   这份元数据是进模型之前由 runner 的 init_forward_metadata() 按【整批未切分】
+        #   的 token 行构造的（page_table / seq_lens_casual / swa_* 都是每 token 一行）。
+        #   prefill CP 按 t % cp_size 把 token 分给各 rank 之后，本 rank 只处理 1/cp_size
+        #   的行，这些 per-token 字段必须同步切掉；否则 kernel 仍按 N 行去读，读到的
+        #   是别的 rank 该负责的行 —— 页表是"该 token 所属请求"的属性，行错=请求错。
+        #
+        # 【两组字段、两种待遇】
+        #   读侧（per-token）：_CP_REINDEX_FIELDS + _CP_REINDEX_OPTIONAL_FIELDS
+        #       按 idx 切片，切完必须恰好 N/cp_size 行。
+        #   写侧（全局落点）：_CP_GLOBAL_FIELDS
+        #       不切，只断言仍是 N 行 —— 压缩器要按全局 token 顺序写整段压缩状态
+        #       （每个 rank 各写一份完整副本，这是"CP 不省 KV"在元数据层面的体现）。
+        #
+        # 【两个调用点，对应两种 CP 实现】
+        #   ① init_forward_metadata_prefill 的 cp_active 分支：策略 CP 或显式传入
+        #      cp_metadata（含尾段布局）时用，行集合由 local_index 精确给出。
+        #   ② ForCausalLM.forward 的块 B：legacy HCU round-robin。元数据晚于
+        #      init_forward_metadata 生成（attn_cp_metadata 在块 B 才创建），
+        #      所以在这里事后重排，行集合用等步长 slice 推导。
+        #
+        # 【不变量】
+        #   · 调用后：每个读侧字段恰好 N/cp_size 行；每个写侧字段仍是 N 行
+        #   · 不做设备同步、不发起集合通信；只有 .contiguous() 可能触发一次拷贝
+        # ==================================================================
         cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size
+        # 【1】切之前的全局行数。
+        #   用 seq_lens_casual 的行数而不是 forward_batch 的 token 数：它是 per-token
+        #   字段，行数就代表这份元数据"认"的行数（含执行 padding）。
+        #   后面的整除断言、期望行数都以它为准。
         pre_global_len = self.seq_lens_casual.shape[0]
+        # 【2a】显式行号分支：调用方给一个 Tensor，里面是本 rank 要保留的行下标。
+        #   用于"行集合不是等步长"的场景，例如尾段 CP 布局（每请求尾行数不同、
+        #   还带各自的 padding），此时无法用 t % cp_size 推导。
         if local_index is not None:
             # 显式行号（非等步长的行集合，例如尾段 CP 布局由调用方算好）
             idx = local_index
@@ -1044,8 +1107,15 @@ class DSV4AttnMetadata:
                 "CP round-robin requires padding to ensure divisibility."
             )
             expected_local_len = pre_global_len // cp_size
+        # 【3】num_tokens 是"全局 token 数"，只服务于下面的写侧校验。
+        #   默认取 pre_global_len；上层可显式传（例如 BCG 回放时传 num_write_tokens，
+        #   用的是 captured out_loc 的长度而不是实时行数）。
         if num_tokens is None:
             num_tokens = pre_global_len
+        # 【4】读侧字段：逐个切片（就地 setattr，函数返回后元数据已变成本 rank 视角）。
+        #   · None 只允许出现在 optional 字段 —— V4.1 没有 c4/c128，那些字段本就是 None
+        #   · .contiguous() 让切完的结果是连续张量，kernel 可直接按行寻址
+        #   · 切完断言行数 == N/cp_size，能抓出"把非 per-token 字段误列进本表"这类错误
         for field_name in self._CP_REINDEX_FIELDS + self._CP_REINDEX_OPTIONAL_FIELDS:
             val = getattr(self, field_name, None)
             if val is None:
@@ -1062,6 +1132,10 @@ class DSV4AttnMetadata:
                 f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
                 f"!= expected_local_len={expected_local_len} (cp_size={cp_size})"
             )
+        # 【5】写侧字段：不切，只校验行数仍是全局值。
+        #   如果这里被切片了（行数 != num_tokens），说明该字段被误放进
+        #   _CP_REINDEX_FIELDS；后果是压缩器写入位置错乱、C1/C2 整段状态错位。
+        #   这些字段是"写到池里的哪个 slot"，天然属于全局地址空间，不属于某个 rank。
         for field_name in self._CP_GLOBAL_FIELDS:
             val = getattr(self, field_name, None)
             if val is None:

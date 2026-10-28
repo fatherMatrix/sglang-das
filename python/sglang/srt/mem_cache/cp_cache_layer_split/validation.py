@@ -38,6 +38,25 @@ def validate_cp_cache_layer_split(args, hf_config):
         args.disaggregation_transfer_backend == "mooncake",
         "requires the Mooncake transfer backend",
     )
+    # ★ 这条限制是"死亡三角"的第三道门（第一道是 V4.1 DSpark PD 的拓扑白名单，
+    #   第二道是 conn.py 里"CP>1 必须走描述符匹配的 LayerSplit"）。
+    #
+    #   三者叠起来的效果：门1 要求开 prefill CP → 门2 要求 CP>1 就必须开 LS
+    #   → 门3 禁止 LS 挂 HiCache，于是"CP + DSpark + PD + HiCache"在 HCU 上
+    #   不存在合法配置。
+    #
+    #   为什么 LS 目前挂不了 HiCache（三处，均为实现完成度问题）：
+    #     ① 层集合：HiCache 的层映射默认恒等（每层都有 buffer），
+    #        而 LS 池只给 owned 连续层分配 buffer
+    #        → 见 _resolve_deepseek_v4_layer_mappings；
+    #     ② 页集合：owner 的持久 buffer 会被 HiCache 的 H2D 回载覆写，
+    #        而 staging 重映射 / pending 广播缓存的是"覆写前"的读状态；
+    #     ③ 静态选页：选页结果缓存在 _batch_active_pages 里跨层复用，
+    #        回载改变槽位布局后必须作废。
+    #
+    #   upstream 没有 V4 LS，所以不存在这条互斥；upstream 的 DSA layer split
+    #   与 HiCache 是打通的（mem_cache/pool_host/* 有 owned-only host 映射），
+    #   说明这不是结构性问题。
     require(
         not args.enable_hisparse and not args.enable_hierarchical_cache,
         "does not yet support HiSparse or HiCache in this HCU port",

@@ -317,7 +317,19 @@ def _evict_until_allocatable(
 def dsv41_dspark_needs_rebootstrap(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> bool:
-    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup."""
+    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup.
+
+    ★ 为什么 retraction 要走"重新 prefill"而不是常规的 CPU 备份/恢复：
+      V4.1 的 C2 配对环（pair ring）和 DSpark 的 draft KV 都是"按请求存放的
+      请求级状态"，不是按 token 线性寻址的 KV，无法用一块连续的 CPU 张量
+      拷回来。所以被抢占（retraction）后，只能让 P 侧重新 prefill 并重放
+      边界 token，把请求级状态重新构建出来。
+
+    触发条件是两个"与"关系：
+      · 投机算法是 DSPARK；且
+      · 池是 V4 池且压缩比里含 2（即 V4.1 形态）。
+    两者都成立才走重算路径 —— V4 Pro 没有 ratio-2 层，因此不会触发。
+    """
     if str(get_spec().speculative_algorithm).upper() != "DSPARK":
         return False
 

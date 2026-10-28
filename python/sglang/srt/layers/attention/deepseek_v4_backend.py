@@ -1717,6 +1717,26 @@ class DeepseekV4AttnBackend(
         cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
+        # ==================================================================
+        # init_forward_metadata_prefill —— 一次 prefill 的"注意力契约"
+        #
+        # 产出 DSV4Metadata，之后整个层循环都读它。要点：
+        #   ① padded_num_tokens：含 CP / 执行 padding 的物理行数
+        #        → 决定后续所有 buffer 的形状，KV 写入按它算
+        #   ② num_write_tokens：压缩器"写全局状态"的行数
+        #        → BCG 回放时用 captured out_cache_loc 长度，而不是实时行数
+        #   ③ expand_prefill_casually：把每请求长度展开成
+        #        "每个 token 的 seq_len / req_idx"（causal 展开）
+        #   ④ make_core_attn_metadata：page table、SWA 窗口元数据、indexer 需求
+        #   ⑤ 若开了 decoder bounded replay：额外产 late_layer_tail
+        #        （只含每请求最后 SWA_WINDOW 行的子批，见 _build_late_layer_tail_metadata）
+        #
+        # 与三个机制的接口：
+        #   · CP     ：cp_active / cp_metadata 决定 padding 与行归属
+        #   · LayerSplit：不在这里，LS 只改 KV 池的 buffer 布局；
+        #                 但 LS 要求 forward_batch 传进来以构造 CP 尾段布局
+        #   · DSpark ：dspark_block_size / dspark_swa_buffers 参与元数据
+        # ==================================================================
         padded_num_tokens = out_cache_loc.shape[0]
         # An explicit layout (decoder SWA tail) is CP too: HCU's legacy prefill CP
         # never reports is_cp_active.
@@ -1936,6 +1956,28 @@ class DeepseekV4AttnBackend(
     def _build_late_layer_tail_metadata(
         self, forward_batch: ForwardBatch, legacy_cp: bool = False
     ) -> DSV4Metadata:
+        # ==================================================================
+        # _build_late_layer_tail_metadata —— decoder bounded replay 的"子批"
+        #
+        # 正常 prefill 的批是"所有 token"；晚层（late_layer_start 之后）只需要
+        # 每请求最后 SWA_WINDOW(128) 个 token，于是这里构造一个"只含尾行"的
+        # 元数据，让晚层用一个更小的批去算。
+        #
+        # 三个关键产物：
+        #   token_indices   ：尾行在原 extend 里的行号（用于切 hidden/Q 等）
+        #   swa_replay_start：每行的窗口下界（floor）—— ★ 决定晚层"能看到多远"
+        #                     floor = seq_len - tail_len，即尾段起点；
+        #                     它保证晚层不会去读"尾段之前、本次没写过的"SWA 行
+        #   out_cache_loc   ：尾行对应的 KV 写入位置（只写这些行）
+        #
+        # 正确性后果（也是 upstream #41303 的由来）：
+        #   晚层的 SWA KV 只有尾行被写。若前缀被别的请求复用，且复用的边界
+        #   不在某次 extend 的尾段上，则那些位置的行从未写过 —— 于是
+        #   swa_reprefill_tail_tokens() 要把匹配末尾 128 token 退回重算。
+        #
+        # CP 交互：cp_tail 是"按本 rank 的 token 切分"后的尾段布局，
+        #   供尾段自己的 all-gather 使用（legacy CP 走 convert_late_layer_tail_to_hcu_cp）。
+        # ==================================================================
         # Each request contributes only its last SWA_WINDOW extend tokens, with the
         # window floored at the tail start: window KV before it is never written here.
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -3276,6 +3318,17 @@ class DeepseekV4AttnBackend(
         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
+        #
+        # ★ 这句话是理解 V4.1 CP 显存特性的关键，拆成两半看：
+        #   · 压缩器（compressor）：先把 hidden all-gather 成全序列
+        #     （cp_materialize_global_token_order），再跑压缩 → 每个 rank 都写出
+        #     一份完整的 C1/C2 状态。所以"开 CP 并不省 KV 显存"，8 个 rank
+        #     各持一份全量副本。省显存要靠 LayerSplit（按层分片）。
+        #   · indexer：只对本地 1/8 的 query 行打分（本函数后半段用
+        #     x[:num_local]），这部分才随 CP 摊薄，是 CP 提速的主要来源之一。
+        #
+        # 另外注意 q_lens_cpu 在 bounded replay 下取的是尾段长度
+        # （tail.local_lens_cpu），因为晚层只处理尾行。
         cp_meta = forward_batch.attn_cp_metadata
         # Legacy HCU round-robin metadata does not populate total_seq_lens.
         # Exclude execution padding from the compressor's request-indexed state.

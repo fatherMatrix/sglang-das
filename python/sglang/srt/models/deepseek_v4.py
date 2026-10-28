@@ -909,6 +909,16 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host, like the attention.
+    #
+    # ratio 1/2 的 source 层在注意力之前要做两件事：跑压缩器（写 C1/C2）、
+    # 跑 indexer（打分 + top-k 选块）。入口统一在 backend 的
+    # forward_low_ratio_sources，它再按是否 prefill CP 分成两条路：
+    #   · 无 CP：直接对本地行跑（backend._forward_low_ratio_sources 主体）
+    #   · 有 CP：走 _forward_low_ratio_sources_cp —— 那里有一条关键事实：
+    #            "Every rank writes the whole prompt's compressed state"
+    #            即压缩器读的是 all-gather 后的全序列，每个 rank 都写一份完整
+    #            压缩状态（这正是不开 LayerSplit 时 KV 不省的原因），
+    #            而 indexer 只对本地 query 行打分（这部分随 CP 摊薄）。
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens == 0:
@@ -2327,6 +2337,17 @@ class MQALayer(MqaAttentionBase):
         if overlap_layer_split_prefetch:
             # Keep collective order unchanged. KV and indexer sources are ready;
             # Q projection only reads q_lora and can overlap the side-stream fetch.
+            #
+            # ★ LayerSplit 的"发起"点。放在这里而不是 attention 之前，是为了
+            #   让 旁路流上的取数 与 主流上的 Q 投影 重叠。
+            #   集合通信顺序必须所有 rank 一致：两个 prefetch 的次序不能变。
+            #
+            #   prefetch_swa_layer     → 借"本层 SWA"（owner = 拥有该层的 rank）
+            #   prefetch_low_ratio_extra_layer → 借"C1/C2 压缩 KV"
+            #                          （owner = 拥有 source 层的 rank，晚层共享 L20）
+            #
+            #   两者内部都会先算页集合并集（第 1 轮），再拷贝广播（第 2 轮）；
+            #   静态选页只影响第 1 轮里"如何取出页号"这一步。
             pool = get_token_to_kv_pool()
             maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
             maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
@@ -2342,6 +2363,23 @@ class MQALayer(MqaAttentionBase):
         x_quant: Optional[torch.Tensor] = None,
         defer_all_reduce: bool = False,
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
+        # ==================================================================
+        # MQALayer.forward —— 单层注意力（V4.1 Flash 的注意力 + KV 读写）
+        #
+        # 阶段（按执行顺序）：
+        #   ① _forward_prepare：QKV 投影 / RoPE / 写 KV
+        #         · ratio 1/2 的 source 层在这里跑压缩器（写 C1/C2）
+        #         · LayerSplit 的"预取"也在这里发起（overlap 模式下）
+        #   ② [仅 LayerSplit] 等预取完成，或确认本层 owned 直接读本地
+        #   ③ attention：从 KV 池读 K/V 并计算
+        #   ④ 输出投影 + all-reduce
+        #
+        # LayerSplit 介入点只有两处：① 末尾的 prefetch、② 的 wait。
+        # 其余代码对 LS 完全透明 —— 因为池的 get_*_buffer 会在内部把
+        # "非 owned 层"翻译成 staging buffer。
+        #
+        # DSpark 介入点：输出会额外产出 draft 需要的 hidden（见模型层捕获）。
+        # ==================================================================
         layer_split_prefill = (
             is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
             and forward_batch.forward_mode.is_context_parallel_extend()
@@ -2577,6 +2615,24 @@ class MQALayer(MqaAttentionBase):
             kv, k_rope = _materialize_cp_unified_fp8_kv(
                 kv, k_rope, forward_batch, torch.cuda.current_stream()
             )
+        # ------------------------------------------------------------------
+        # ★ LayerSplit 的两段式：先"发起取数"，再"等取数完成"
+        #
+        # 背景：LS 下每个 CP rank 只拥有连续的一段层。算到别人的层时，
+        # 需要 owner 把"本次 query 真正会读到的那些页"搬过来。
+        #
+        # 取数分两轮集合通信（都在 KV 池内部，这里只是调用入口）：
+        #   第 1 轮：各 rank 把"我要读哪些页"写成掩码 → CP 内 all-reduce 求并集
+        #            → 取出并集里的页号（静态选页就在这里，见 staging.py）
+        #   第 2 轮：owner 把选中页的 KV 行紧凑拷进 staging → 广播给所有 rank
+        #
+        # overlap_layer_split_prefetch == True 时（HCU + V4.1 + CP + C1/C2 层），
+        # 第 1、2 轮已在 _forward_prepare 末尾发起（旁路流），这里只做"等待"，
+        # 从而与 Q 投影重叠；否则在这里补发起，紧跟着等。
+        #
+        # 注意：非 owned 层如果没有先 prefetch 过，池子会直接抛异常
+        # （_raise_for_missing_non_owned_prefetch）—— 这不是可选优化。
+        # ------------------------------------------------------------------
         if layer_split_prefill:
             pool = get_token_to_kv_pool()
             if not overlap_layer_split_prefetch:
@@ -3364,6 +3420,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
+        # ==================================================================
+        # DeepseekV4DecoderLayer.forward —— 一层的两半
+        #
+        #   前半：mHC 边界（hc_post 上一层的输出 + hc_pre 本层的输入归一化）
+        #         → MQALayer（注意力；KV 读写、LayerSplit 预取都在里面）
+        #   后半：MoE（路由 → DeepEP 派发 → 专家计算 → 合并）
+        #         或 dense MLP（前若干层）
+        #
+        # 与三个重点机制的关系：
+        #   · LayerSplit：完全封装在 MQALayer → KV 池内部，本层不感知
+        #   · HiCache   ：不参与 forward，只在调度阶段做前缀命中/回载；
+        #                 回载会改写 owner 的持久 buffer，因此 LS 池需要
+        #                 invalidate_staging_for_hicache() 作废读状态
+        #   · DSpark    ：本层若在捕获集合中，模型层会在层返回后取出 hidden
+        #                 （见 DeepseekV4Model.forward 的捕获分支）
+        # ==================================================================
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
@@ -4213,6 +4285,14 @@ class DeepseekV4Model(nn.Module):
 
         # Decoder SWA bounded replay: layers past the last kv_source layer run over
         # each request's last SWA_WINDOW extend tokens only.
+        #
+        # ★ decoder bounded replay 的分界线就在这里：
+        #   最后一个 kv_source 层（V4.1 是 L20）之后的层都算"晚层"，它们
+        #   不自建压缩记忆，直接读 source 层产出的 C1/C2，所以只需要最后
+        #   SWA_WINDOW 个 token 的局部窗口就够。
+        #
+        # 下面的 assert 是整条优化成立的前提：晚层若自带压缩（ratio 4/128），
+        # 就必须见过全部 token，不能只算尾段。V4.1 的 ratio ⊆ {0,1,2} 满足该前提。
         self.late_layer_start: Optional[int] = None
         if get_exec().features.enable_decoder_swa_bounded_replay:
             assert config.kv_source_layer_ids, (
@@ -4268,6 +4348,14 @@ class DeepseekV4Model(nn.Module):
 
     def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
         # Rows outside the tail are never computed past the last kv_source layer.
+        #
+        # 这是 decoder SWA bounded replay 的正确性护栏：晚层只算了每请求最后
+        # 128 行，因此任何"需要读到尾段之外那些行"的请求都必须被拒绝，而不是
+        # 悄悄返回错的 logprob：
+        #   · CaptureHiddenMode.FULL 且非 DSpark 捕获 → 需要全部 prompt 行的 hidden
+        #   · 需要 prompt logprob（logprob_start_len 早于 prompt 末尾）→ 需要那些行
+        # 允许的情形：只要所有 prompt 行的 hidden 都要（即不裁剪），或者只关心
+        # 输出 token 的 logprob。
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.dspark_layers_to_capture is None
@@ -4565,6 +4653,27 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # ==================================================================
+        # DeepseekV4Model.forward —— 整个 forward 的主干（骨架，按阶段读）
+        #
+        # ① 输入准备：embedding（首 rank）或 PP 接续；mHC 通道广播
+        # ② Prefill CP 切分：把 [总 token] 切成 [本 rank 的 token]
+        #      legacy 路径（HCU 在用）在这里切；策略路径（cp_v2）在 runner 里切
+        # ③ 确定 DSpark aux 捕获集合（哪些层的 hidden 要留给 draft 模型）
+        # ④ 判定是否走 TBO（two-batch-overlap）；捕获 DSpark 时不走
+        # ⑤ 层循环：每层 = mHC 边界 → MQALayer（注意力 + KV 读写）→ MoE
+        #      ★ LayerSplit / HiCache 的钩子都在 MQALayer 和 KV 池内部，
+        #        本函数只负责把 forward_batch / positions 正确切好传下去
+        # ⑥ 输出 CP all-gather：把各 rank 的 token 还原成完整序列
+        # ⑦ DSpark aux 打包 + PP 转发
+        # ⑧ 交给 ForCausalLM 出 logits（本函数只返回 hidden/aux）
+        #
+        # 读代码时的关键区分：
+        #   - "计算怎么切" 由本函数决定（②⑥）
+        #   - "KV 存在哪、从哪读" 由 KV 池决定（LayerSplit / HiCache）
+        #   - "KV 传不传给 D" 由 disaggregation 决定
+        #   三者互不耦合，出问题时先定位属于哪一类。
+        # ==================================================================
         cp_v2_active = is_cp_v2_active(forward_batch)
         use_prefill_cp = (dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch))
         incoming_pd_aux_hidden_states: List[torch.Tensor] = []
@@ -4675,6 +4784,20 @@ class DeepseekV4Model(nn.Module):
                     1, self.hc_mult, 1
                 )
             deferred_mhc_input = None
+        # ------------------------------------------------------------------
+        # ② Prefill CP 切分（本函数只切"计算输入"，不切 KV 存储）
+        #
+        #   HCU 现状：cp_v2_active == False（enable_cp_v2() 对 HCU 恒 False），
+        #   走下面的 legacy 分支 —— 在"数据准备层"按 round-robin 把 token
+        #   分给各 CP rank，元数据写入 forward_batch.attn_cp_metadata。
+        #
+        #   为什么不能在策略层再切一次：is_cp_active() 对 HCU 返回 False，
+        #   否则模型层会二次切分，而 attention backend 读的仍是 legacy 元数据，
+        #   token↔rank 映射会错位（shards the model inputs a second time）。
+        #
+        #   注意：切 token ≠ 切 KV。非 LayerSplit 时每个 rank 仍持有整段序列
+        #   的 KV 副本；省 KV 显存的是 LayerSplit，不是 CP。
+        # ------------------------------------------------------------------
         if use_prefill_cp and not run_tbo:
             if cp_v2_active:
                 # Generic CP already shards model inputs in the runner.
@@ -4732,6 +4855,19 @@ class DeepseekV4Model(nn.Module):
             use_fused = self.use_fused_mhc_post_pre
             prev_residual, prev_post, prev_comb = None, None, None
             last_layer = None
+            # ----------------------------------------------------------
+            # ⑤ 正常层循环：每层进入 DeepseekV4DecoderLayer.forward
+            #    → MQALayer.forward（注意力 + KV 读写）
+            #    → MoE / dense MLP
+            #
+            #    这里看不到 LayerSplit 的判断，因为 LS 完全封装在 KV 池里：
+            #    池子只给自己拥有的层分配 buffer，读非 owned 层时走
+            #    staging + 广播（见 cp_cache_layer_split/deepseek_v4_pool.py）。
+            #    本循环对 LS 是透明的。
+            #
+            #    DSpark 的捕获也在这里：命中的层把 hc_post 之后的 hidden
+            #    取 mean 存进 pd_aux_hidden_states，供 draft 模型使用。
+            # ----------------------------------------------------------
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
                 last_layer = layer

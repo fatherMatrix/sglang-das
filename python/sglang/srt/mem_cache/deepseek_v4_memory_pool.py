@@ -1070,6 +1070,39 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+    """V4 / V4.1 的设备 KV 池。读这个类之前先建立"家族"概念。
+
+    ======================================================================
+    一次注意力要读的 KV 不是"一层一块"，而是按来源分成若干家族：
+    ======================================================================
+
+      · SWA            ：本层私有、宽度 = sliding_window(128) 的滑窗 KV。
+                         每个 token 一行；只有最近 128 个 token 的行活着。
+      · 压缩 KV（C4/C128 或 C1/C2）：
+                         由 kv_source 层（V4.1 是 L20 那批）把连续 token
+                         压成一条，供该层及之后的"晚层"共享读取。
+                         V4 Pro = {C4, C128}；V4.1 Flash = {C1, C2}。
+      · indexer        ：给 top-k 检索打分的 K（V4.1 是 FP4）。
+                         它**按 rank 复制**（每 rank 都要跑本地 top-k），
+                         不参与 LayerSplit 的层分片。
+      · 压缩状态（state）：C2 的"配对环"等按请求/位置存放的状态，
+                         不属于线性 KV，不能按 token 寻址。
+
+    三个"必须分清"的点：
+      ① 只有压缩 KV 是按"源层"归属的。晚层的注意力读的是 source 层的
+         压缩 KV，不是自己的 —— 所以 LayerSplit 下 owner 可能不是本层层号。
+      ② indexer 是复制的。所以"按层分片"对 indexer 无效，它在每个 rank
+         都有完整副本（这也解释了为什么 PD 传输会重复发 indexer）。
+      ③ 压缩状态是按请求的，不能 CPU 备份 → retraction 只能重算
+         （见 mem_cache/common.py: dsv41_dspark_needs_rebootstrap）。
+
+    Pool 与上层的关系：
+      · forward 通过 get_*_buffer / set_*_buffer 访问本类；
+      · HiCache 通过 get_kv_transfer_layout / *_layer_mappings 读取布局；
+      · PD 通过 kv_args（指针 + item_len）搬数据。
+    三者都不直接碰 buffer 内部，所以改布局时只需保证这三套接口一致。
+    """
+
     # object.__new__ stubs (disagg wire test) skip __init__; False is the env
     # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
     _unified_kv_fp8 = False

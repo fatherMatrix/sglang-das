@@ -45,6 +45,23 @@ def contiguous_request_page_capacity(
     A span can touch at most ceil(length / page_size) + 1 pages. Summing across
     requests is bounded by ceil(total_tokens / page_size) + 2 * num_reqs; the
     extra per-request allowance also covers padded entries mapped to page 0.
+
+    ★ 这个函数只算"上界"，静态选页靠它把输出长度变成主机已知的常量。
+      它的成立前提与"页在池里是否连续"无关——页数由 token 数决定：
+
+        · 池按整页分配，一个请求的 N 个 token 就占 ceil(N/page_size) 个页，
+          这些页在池里是连号还是散号，页数都不变；
+        · 逻辑上连续的一段 token 最多跨 ceil(L/page_size) + 1 个页
+          （最坏起点偏移多跨一页）；
+        · 滑窗历史（SWA_WINDOW-1 个 token）紧邻 extend 起点之前，
+          最多额外占 1 个页（窗口宽度 < 页大小）；
+        · 每请求 +2 就分别对应上面两项：一次边界偏移 + 一次滑窗溢出。
+          （page 0 的 padding 项也由这 2 个余量吸收。）
+
+      所以真正被这个上界依赖的假设是"每个请求的读集合在逻辑 token 空间里
+      是一段"（extend + 其前滑窗），而不是"物理页连号"。
+      调用方传进来的 total_tokens 已经按 min(seq_len, extend + window - 1)
+      折算过，正是为了维持这个前提。
     """
     if total_tokens == 0:
         return min(max_pages, 1)
@@ -125,7 +142,28 @@ def active_pages_for_indices(
     pynccl_comm,
     static_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Select pages touched by any CP rank; all ranks must call in the same order."""
+    """Select pages touched by any CP rank; all ranks must call in the same order.
+
+    ★ LayerSplit 读非 owned 层的第 1 轮集合通信，分三步：
+
+      1) build_active_pages_mask：把本 rank 要读的 token 下标转成页号，
+         在长度固定为 max_pages 的 int32 掩码上置位（掩码本身大小恒定）。
+      2) all_reduce_active_pages_mask：CP 组内求和 → "任意 rank 命中"的并集。
+         所有 rank 必须同序调用（集合通信）。
+      3) 从并集掩码里取出被选中的页号：
+           static_size 不为 None → torch.nonzero_static(size=..., fill_value=-1)
+                                   输出长度是常量，主机不需要读设备
+           static_size 为 None   → torch.nonzero(...)
+                                   输出长度设备才知道 → 主机必须等一次 D2H
+
+      第 3 步的差别不在"结果对不对"，而在"主机能不能连续提交后续指令"：
+      第 2 轮（owner 拷贝 + 广播）的字节数等于页数 × item_len，页数要作为
+      主机侧参数提交；动态长度会把 主机 卡在同步点上，既让设备空转，
+      也让旁路流排不进指令，于是整段只能留在主流上串行执行。
+
+      填充槽（-1）由 remap_indices_to_staging 映射成越界哨兵，
+      owner 侧拷贝时 clamp 成 0（重复拷 page 0，内容不会被读）。
+    """
     local_mask = build_active_pages_mask(indices, page_size, max_pages)
     local_mask = all_reduce_active_pages_mask(local_mask, pynccl_comm)
     if static_size is not None:

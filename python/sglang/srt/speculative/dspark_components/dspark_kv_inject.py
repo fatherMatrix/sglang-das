@@ -1,3 +1,23 @@
+"""DSpark：把 target 的隐藏状态/上下文"注入"给 draft 模型。
+
+DSpark 的 draft 不是独立小模型，而是**寄生在 target 的若干层上**：
+  1. target prefill 时，捕获集合内的层（dspark_layers_to_capture）把
+     hidden 取 mean 暂存（见 models/deepseek_v4.py 的捕获分支）；
+  2. 这里把暂存的 hidden 注入 draft 的 forward_batch，draft 用自己的
+     SWA/注意力在"target 的 KV 语义"上起草 token；
+  3. PD 分离时，第 1 步的产物要跨节点传给 D 侧（draft 在 D 上跑），
+     因此有一套 get_dsv41_spec_layout 的布局握手 —— V4.1 的 ratio-2 配对
+     状态和 draft SWA 状态必须两边逐字段一致，否则握手直接拒绝。
+
+三个易错点（读代码时优先确认）：
+  · pair ring / draft KV 是按请求存放的，不能用 CPU 张量备份 →
+    retraction 时只能让 P 重新 prefill（dsv41_dspark_needs_rebootstrap）；
+  · draft SWA 必须"每 rank 一份完整副本"，不能参与 CP 层分片
+    （LayerSplit 只切 target 的层，draft 池不切）；
+  · 布局握手要求 ratio-2 与 DSPARK 同时成立才会触发，所以 V4 Pro
+    （ratio ⊆ {0,4,128}）永远不会走到这条路径。
+"""
+
 from typing import Optional
 
 import torch

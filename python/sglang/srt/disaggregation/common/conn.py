@@ -1338,6 +1338,19 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
+            # ★ 门2：V4.1 + DSpark 的 PD 握手，对 P 侧 CP 有三种放行方式
+            #   ① 两端 CP 都为 1（最保守）
+            #   ② P 侧 CP>1，且 P 用了"描述符匹配"的 LayerSplit（下面的条件）
+            #   ③ （upstream #40323 起）P 侧 CP>1 且两端 attention TP 对齐 ——
+            #      本 fork 未合入该提交，所以这里没有这条
+            #
+            #   layer_split_mla_layout 的六个条件其实在表达一件事：
+            #   "P 用层分片，D 用完整池，两端的 KV 池形状无法用位置对应，
+            #     只能靠 (family, layer) 描述符配对"，因此还要求
+            #   两端 attn_tp=1、D 侧 CP=1、DCP=1、是 MLA 后端。
+            #
+            #   注意 self.attn_cp_size == 1 这一项：门1 的白名单已经把 D 侧
+            #   钉死为 attention-DP=TP 且 CP=1，所以这里恒成立。
             layer_split_mla_layout = (
                 info.cp_cache_layer_split
                 and info.attn_cp_size > 1

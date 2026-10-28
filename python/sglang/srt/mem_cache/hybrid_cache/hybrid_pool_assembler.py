@@ -113,6 +113,27 @@ class _DeepSeekV4LayerMappings(NamedTuple):
 def _resolve_deepseek_v4_layer_mappings(
     kvcache: Any,
 ) -> _DeepSeekV4LayerMappings:
+    """把"设备池的层"翻译成"host 池的层下标"。
+
+    ★ 这是 HiCache 与 LayerSplit 冲突的第一现场。
+
+    本函数产出的映射是**恒等映射**：设备层 l ↔ host 层 l。它对
+    "每层都有 buffer"的池（即非 LayerSplit，V4 Pro 生产形态）是正确
+    而高效的——host 池按同样的层数分配即可。
+
+    但 LayerSplit 池只给本 rank 拥有的连续层分配 buffer，各 family 的
+    buffer 数量是"owned 层数"而不是全 stage 层数：
+      · swa 映射若仍是 range(0, 全 stage)，会索引到不存在的 host 层；
+      · c1/c2（V4.1 的压缩家族）在这里根本没有对应字典；
+      · draft SWA 的打包值基也必须是 owned 数量，而不是 transfer_layer_id_max。
+    所以 LS 池要么在装配层构造 owned-only 映射（并补齐 c1/c2），
+    要么 HiCache 根本不能挂上去。
+
+    注意：本函数与 upstream v0.5.22 逐行一致，HCU 没有改过它。
+    也就是说"HiCache 不支持 V4 的层分片"是这张恒等映射的直接后果，
+    不是 HiCache 的架构限制（upstream 的 DSA layer split 就有对应的
+    owned-only host 映射，见 mem_cache/pool_host/*）。
+    """
     transfer_layer_id_max = kvcache.end_layer - kvcache.start_layer
     full = {layer: layer for layer in range(transfer_layer_id_max)}
     swa = full.copy() if kvcache.swa_kv_pool is not None else {}
@@ -845,6 +866,29 @@ def build_deepseek_v4_hicache_stack(
     enable_storage_metrics: bool = False,
     layer_mappings: Optional[_DeepSeekV4LayerMappings] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    """装配 V4/V4.1 的 HiCache host 池栈（L2），返回 host 组 + 控制器。
+
+    流程骨架：
+      ① 解析层映射（layer_mappings）：设备层 ↔ host 层的翻译表
+      ② 按 family 建 host 池：
+           SWA（+draft SWA 尾随）、C4 KV/indexer、C128 KV、低压缩比 C1/C2、
+           以及各类 request-scoped 压缩状态
+      ③ 建 HybridCacheController，把 attn_cp_group 传进去
+         —— 各 CP rank 的 radix 命中与分配要在 CP 组内对齐，这是
+            "HiCache 能与 CP 共存"的结构性前提（V4 Pro 生产形态即如此）
+      ④ 返回 (host 组, 控制器)，由上层挂到树上
+
+    与 LayerSplit 的关系：
+      这里默认"设备池每层都有 buffer"。LS 池不满足该前提（只有 owned 层），
+      所以要么由调用方传入 owned-only 的 layer_mappings，要么 LS 池无法挂
+      HiCache。本函数自己不判断 LS（保持与 upstream 同源），
+      冲突检查在 cp_cache_layer_split/validation.py。
+
+    与 DSpark 的关系：
+      draft SWA 的 host 层要排在 target 的 owned SWA buffer **紧后**，
+      且 key 空间仍是 transfer_layer_id_max + depth —— 因为
+      HybridCacheController 是用 transfer_layer_id_max + depth 去查 draft 层的。
+    """
     page_size = params.page_size
     layer_mappings = layer_mappings or _resolve_deepseek_v4_layer_mappings(kvcache)
     transfer_layer_id_max = layer_mappings.transfer_layer_id_max

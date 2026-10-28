@@ -60,7 +60,53 @@ class _BatchActivePages:
 class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
     CpCacheLayerSplitPoolBase, DeepSeekV4TokenToKVPool
 ):
-    """DeepSeek V4 pool that reads non-owned layer KV through staging buffers."""
+    """DeepSeek V4 pool that reads non-owned layer KV through staging buffers.
+
+    ======================================================================
+    LayerSplit（LS）全貌 —— 读本文件前先看这段
+    ======================================================================
+
+    【动机】
+    不开 LS 时，prefill CP 的每个 rank 都持有整段序列的完整 KV（压缩器把
+    全序列 all-gather 后每个 rank 各写一份），8 卡就是 8 份全量副本。
+    LS 在"层"这个维度再切一刀：每个 CP rank 只持久化一段连续层的 KV，
+    于是单 rank 的持久 KV 降到约 1/8。upstream 对 V4 明确不这么做
+    （它选择每 rank 复制，换取"无需层所有权协议"），所以本包是 HCU 私有。
+
+    【拥有关系】
+    get_layer_shard_range(rank, cp_size, total_layers) 给出连续区间
+    [owned_start, owned_end)；只有落在区间内的层才会在本 rank 分配 buffer。
+    因此池里各 family 的 buffer 数量是"owned 层数"，不是全 stage 层数。
+    >>> 这是与全局代码（HiCache 层映射、容量估算、draft 打包）冲突的根源：
+        凡假设"每层都有 buffer"的地方都会失效。
+
+    【读非 owned 层 = 两轮集合通信 + 一次本地重映射】
+      第 1 轮（staging.py: active_pages_for_indices）
+        各 rank 把"本次 query 要读哪些页"写成定长掩码 → CP 内 all-reduce
+        求并集 → 取出并集页号（静态选页决定这一步的输出长度是否已知）。
+      第 2 轮（本文件 _compact_broadcast_for_read）
+        owner 把并集页的 KV 行紧凑拷进 staging → pynccl 广播给所有 rank。
+      重映射（remap_*_for_read）
+        全局页号 → staging 下标，未选中置 -1，kernel 跳过。
+    这两轮可以整段丢到旁路流（overlap），也可以贴主流串行执行。
+
+    【PD 传输】
+    requires_descriptor_matched_transfer = True 让 kv_args.cp_cache_layer_split
+    为真，从而 P 侧发送时带 (family, global_layer) 描述符，D 侧按名字配对，
+    而不是按"列表位置"配对（LS 下 P 每 rank 的 buffer 列表只是子集，
+    位置配对必然错位）。
+
+    【与 HiCache 的冲突面】
+      ① 层集合：HiCache 的层映射默认恒等（每层都有 buffer）→ 对 LS 池必错
+      ② 页集合：HiCache 回载按空闲链分配，会打散槽位；静态选页的上界依赖
+                "读集合在逻辑 token 空间里是一段"，与槽位是否连号无关，
+                但 staging 的读状态会引用"即将被 H2D 覆写的页"
+      ③ 读状态：H2D 回载覆写 owner 持久 buffer → 上一轮的 staging 重映射 /
+                pending 广播失效 → 需要 invalidate_staging_for_hicache()
+      详见 mem_cache/cp_cache_layer_split/HICACHE_IMPLEMENTATION.md（devel 分支）
+      以及 anno 文档中的机制拆解。
+    ======================================================================
+    """
 
     requires_descriptor_matched_transfer = True
 
@@ -395,7 +441,21 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         selected_pages_static: bool = False,
         in_broadcast_slot: bool = False,
     ) -> torch.Tensor:
-        """Broadcast owner's compact active pages and optionally remap indices."""
+        """Broadcast owner's compact active pages and optionally remap indices.
+
+        第 2 轮集合通信：owner 紧凑拷贝 + 全员广播。
+
+        参数语义：
+          source          —— owner 的 KV buffer；非 owner 传 None
+          staging         —— 复用的临时缓冲（按整池最坏情况预分配）
+          selected_pages  —— 第 1 轮产出的页号；静态选页时尾部含 -1 填充槽
+          in_broadcast_slot —— True 表示调用方已持有旁路流槽位（异步路径），
+                              本函数就不再自己 start 一条流
+
+        关于下面的容量检查：staging 是按"整池页数"分配的，而并集掩码最多
+        产生 max_pages 个非零项，所以该检查实际上到不了；真正保证不越界的
+        是第 1 轮的容量上界（staging.py: contiguous_request_page_capacity）。
+        """
         if selected_pages.numel() > staging.shape[0]:
             raise RuntimeError(
                 "CP Cache LayerSplit staging buffer is smaller than active page set: "
@@ -420,11 +480,15 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             else layer_id
         )
         owner_cp = self._get_layer_owner_rank(owner_layer_id)
+        # 只有 owner 有真实数据（source 非 None）；其余 rank 跳过拷贝直接参与广播。
         if self.cp_rank == owner_cp:
             assert source is not None
             if active_pages > 0:
                 copy_pages = selected_pages
                 if selected_pages_static:
+                    # 静态选页的填充槽是 -1，clamp 成 0 即重复拷 page 0。
+                    # 这些槽位不会被任何 query 索引到（remap 已把它们指向
+                    # 越界哨兵），所以拷什么内容都无所谓。
                     copy_pages = selected_pages.clamp_min(0)
                 # Pack directly into staging: advanced indexing would allocate
                 # a full payload and then copy it again before the broadcast.
@@ -598,7 +662,28 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         num_reqs: Optional[int] = None,
         read_token_capacity: Optional[int] = None,
     ) -> None:
-        """Start current-layer SWA page broadcast; caller waits before attention."""
+        """Start current-layer SWA page broadcast; caller waits before attention.
+
+        本层 SWA 的"借用"入口。执行顺序（与 _compact_broadcast_for_read 合起来）：
+
+          1) wait_layer_transfer(layer_id)
+             —— 若本层正好有 HiCache 回载在途，先等它落地（流级事件），
+                否则会读到恢复前的旧内容。
+          2) _clear_extra_read_state()
+             —— 清掉上一层的 extra 读状态（SWA / extra 两个 family 交替使用）。
+          3) 选页（每 batch 只做一次，结果缓存在 _batch_active_pages["swa"]）
+             —— 先算 static_size（静态选页的上界，可为 None），
+                再调 _active_pages_for_indices 做第 1 轮集合通信 + 取页号，
+                最后 remap_indices_to_staging 得到本 rank 的读下标。
+                ★ 静态 vs 动态只影响第 1 轮里"取页号"的输出长度是否已知，
+                  从而决定第 2 轮能否异步化。
+          4) owner 侧定位自己的 buffer
+             —— 非 owner 时 owner_buf 为 None（数据只在 owner 显存里）。
+          5) _compact_broadcast_for_read 完成第 2 轮：拷贝 + 广播。
+
+        注意 3) 之后同一次 forward 内后续层会复用选页结果，
+        因为同一批请求的读集合在一层之内是确定的。
+        """
         self.wait_layer_transfer(layer_id)
         self._clear_extra_read_state()
         max_pages = self._pool_num_pages(self.swa_kv_pool)
@@ -654,7 +739,12 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         self._swa_remapped_layer_id = layer_id
 
     def wait_swa_prefetch(self, layer_id: int) -> None:
-        """Wait for the pending SWA prefetch before attention consumes it."""
+        """Wait for the pending SWA prefetch before attention consumes it.
+
+        汇聚点：finish() 会让当前流等待该 layer 对应的旁路流，把 第1轮选页 +
+        第2轮拷贝广播 的结果变成可见。模型层在 attention 之前显式调用它。
+        （extra / indexer 的等待不是在这里，而是在 get_*_buffer 内部自动 finish。）
+        """
         self._broadcast_slots.finish("swa", layer_id)
 
     def _prefetch_c128_key_pages(self, layer_id: int, indices: torch.Tensor) -> None:
@@ -994,6 +1084,13 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         return self._get_staging_buffer("swa")
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
+        # LS 的"读路径分叉点"，attention 取 K buffer 时进这里：
+        #   · 本层已 prefetch 过（_swa_remapped_layer_id 命中）→ 读 staging
+        #     （内容是本 rank 拥有该层的那个 peer 广播过来的）
+        #   · 本 rank 就是 owner            → 读自己的持久 buffer
+        #   · 既不是 owner 又没 prefetch     → 直接抛错。
+        #     ★ 这条 assert 说明 第1轮+第2轮 对 non-owned 层是强制的，
+        #       静态选页只是决定"怎么取页号"，不是可选优化。
         if self._swa_remapped_layer_id == layer_id:
             return self._get_staging_buffer("swa")
         if self._owns_swa_layer_id(layer_id):

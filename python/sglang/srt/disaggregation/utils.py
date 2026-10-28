@@ -2193,7 +2193,27 @@ def setup_state_kv_args(
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
-    """Describe the positional transfer layout without pool capacities or pointers."""
+    """Describe the positional transfer layout without pool capacities or pointers.
+
+    ★ V4.1（ratio-2）+ DSpark 的 PD 布局握手。它描述的**不是指针或容量**，
+      而是"位置性布局"：draft token 数、压缩比序列、每个 KV/状态条目的
+      层 id 与每 token 字节数。P 与 D 必须逐字段一致，否则拒绝握手。
+
+    为什么需要它：C2 层把相邻两个 token 压成一个条目，还有一个"按请求存放
+    的配对环境"；DSpark 的 draft 又会额外占用 SWA 状态。这些都不是"容量"
+    层面的东西，无法用简单的指针+长度描述，只能用布局描述对齐。
+
+    返回 None 的两种情况（很关键）：
+      · 模型的压缩比里没有 2（例如 V4 Pro 是 {0,4,128}）→ 永远不走这条路径；
+      · 没开 DSPARK。
+    这两条决定了 V4 Pro 在 HCU 上不需要这套握手，也解释了为什么它
+    "CP 不开 LayerSplit + hicache"能跑而 V4.1 不行（门2 只在有 layout 时生效）。
+
+    下面的 == 2 检查：target 与 draft 必须各有一份 SWA 状态。
+    LayerSplit 的实现若把本该复制的 draft SWA 误标成"层分片"（例如给池加
+    layer_shard_enabled=True），会让所有 rank 都跳过 draft 传输，这里就会崩
+    —— 这是 HCU 侧踩过的坑，改动 LS 池属性时要特别小心。
+    """
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
     if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
         return None

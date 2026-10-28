@@ -684,11 +684,22 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         注意 3) 之后同一次 forward 内后续层会复用选页结果，
         因为同一批请求的读集合在一层之内是确定的。
         """
+        # 【步骤 1】等本层的 HiCache 回载落地（若有）。
+        #   回载会覆写 owner 的持久 buffer，而下面第 2 轮的广播正是从那份 buffer 读，
+        #   不等就会读到恢复前的内容。用流级事件等待，不阻塞主机。
         self.wait_layer_transfer(layer_id)
         self._clear_extra_read_state()
+        # 【步骤 2】取本 family 的池几何：页数上限与页大小。
+        #   掩码长度 = max_pages，选页结果的下标也就天然落在 [0, max_pages)。
         max_pages = self._pool_num_pages(self.swa_kv_pool)
         page_size = self.swa_kv_pool.page_size
         swa_cache = self._batch_active_pages["swa"]
+        # 【步骤 3】第 1 轮集合通信：算"本批所有 rank 合起来要读哪些页"。
+        #   每个 batch 只算一次，结果缓存在 _batch_active_pages["swa"] 里，
+        #   同一次 forward 内后续层复用（页集合在一层之内是确定的）。
+        #   其中的 static_size 就是静态选页的上界：
+        #     有值 → nonzero_static，输出长度主机已知
+        #     None → nonzero，长度要读回设备（一次 D2H）
         if swa_cache.selected_pages is None:
             static_size = None
             if (
@@ -717,6 +728,9 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 max_pages,
                 static_selected_pages=swa_cache.static_selected_pages,
             )
+        # 【步骤 4】第 2 轮集合通信的准备：定位 owner 的源 buffer。
+        #   非 owner 的 owner_buf 为 None —— 数据只存在于 owner 的显存里，
+        #   所以必须靠广播（而不是各读各的）。
         selected_pages = swa_cache.selected_pages
         staging = self._get_staging_buffer("swa")
         owner_cp = self._get_layer_owner_rank(layer_id)
@@ -891,6 +905,14 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         if item.compress_ratio == 4:
             self._prefetch_index_k_pages(layer_id, page_table)
 
+    # 【prefetch_low_ratio_extra_layer】C1/C2 压缩 KV 的"借用"入口。
+    #   与 prefetch_swa_layer 同构（同样是两轮通信），差别有三处：
+    #     1. owner 是"source 层"所属的 rank，不是本层层号的 owner ——
+    #        晚层共享 L20 的记忆，所以同一份 C1/C2 会被多个 rank 借。
+    #     2. 选页的输入是压缩后的 token 号（按 ratio 折算），页大小也是折算后的。
+    #     3. 只有拿到静态 size 且不在图捕获中时，整段才走 async_pages
+    #        提交到旁路流（可见 "only fixed-size selection can be submitted
+    #        without a device-to-host shape sync" 那句注释）。
     def prefetch_low_ratio_extra_layer(
         self,
         layer_id: int,

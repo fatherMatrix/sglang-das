@@ -1737,6 +1737,10 @@ class DeepseekV4AttnBackend(
         #                 但 LS 要求 forward_batch 传进来以构造 CP 尾段布局
         #   · DSpark ：dspark_block_size / dspark_swa_buffers 参与元数据
         # ==================================================================
+        # 【块 1】确定本批的物理行数。
+        #   非 CP：就是 out_cache_loc 的长度（含执行 padding）。
+        #   CP   ：改用"各 rank 实际 token 之和"，因为切分后每 rank 行数不同，
+        #          集合通信与 KV 写入都按这个数对齐。
         padded_num_tokens = out_cache_loc.shape[0]
         # An explicit layout (decoder SWA tail) is CP too: HCU's legacy prefill CP
         # never reports is_cp_active.
@@ -1749,6 +1753,9 @@ class DeepseekV4AttnBackend(
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
         # Execution padding also applies when a short HCU batch cannot use CP.
+        # 【块 2】把尾段的窗口下界（swa_replay_start）补齐到 padded 长度。
+        #   bounded replay 只给"尾行"算下界，物理 padding 行没有值；
+        #   补齐后 kernel 才能按统一形状索引。
         if (
             swa_replay_start is not None
             and swa_replay_start.shape[0] < padded_num_tokens
@@ -1760,6 +1767,9 @@ class DeepseekV4AttnBackend(
 
         # BCG replay restores the captured out_cache_loc length, so the global
         # (compressor write) fields must be sized by it rather than the live rows.
+        # 【块 3】压缩器"写全局状态"的行数。
+        #   图捕获时用 captured out_cache_loc 的长度而不是实时行数，
+        #   否则回放时写入范围会与捕获时不一致。
         num_write_tokens = (
             out_cache_loc.shape[0] if use_prefill_cuda_graph else num_tokens
         )
@@ -1774,6 +1784,9 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_tensor=extend_seq_lens,
             extend_start_loc=extend_start_loc,
         )
+        # 【块 4】核心注意力元数据：page table、每 token 的 seq_len / req 索引、
+        #   SWA 窗口元数据。★ 这是"每个 token 该读哪些 KV"的唯一来源，
+        #   后续所有读路径（含 LayerSplit 的选页）都以它为输入。
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -1788,11 +1801,15 @@ class DeepseekV4AttnBackend(
             swa_replay_start=swa_replay_start,
             num_groups=len(extend_seq_lens_cpu),
         )
+        # 【块 5】CP 专属修正：把元数据改成"本 rank 视角"（行数、窗口、
+        #   收集/重排索引）。legacy CP 与策略 CP 的元数据结构不同，这里只做公共部分。
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
                 num_tokens=num_write_tokens, local_index=cp_metadata.local_index
             )
             core_attn_metadata.init_flashmla_related(is_prefill=True)
+        # 【块 6】indexer 元数据：只在需要压缩（need_compress）时构造，
+        #   描述本 chunk 的 indexer 查询行与候选块。V4.1 的 top-k 选页依赖它。
         indexer_metadata = (
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
@@ -1840,6 +1857,8 @@ class DeepseekV4AttnBackend(
                     online_state_slot_offset=online_c128_state_slot_offset,
                 )
 
+        # 【块 7】打包成 DSV4Metadata，交给整个层循环复用。
+        #   之后每层只读这份元数据，不再重算 page table。
         metadata = DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
@@ -1848,6 +1867,8 @@ class DeepseekV4AttnBackend(
                 create(compress_ratio=128) if self.has_c128 else None
             ),
         )
+        # 【块 8】图捕获路径的额外准备：把 indexer 的 page table 按压缩比展开、
+        #   按固定 chunk 切行，保证图形状在整个捕获期内不变。
         if use_prefill_cuda_graph and self.low_ratio_prefill_graph:
             low = core_attn_metadata.low_ratios
             metadata.c1_indexer_metadata = (

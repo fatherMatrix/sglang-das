@@ -1958,6 +1958,15 @@ class MQALayer(MqaAttentionBase):
 
         return q
 
+    # 【_forward_prepare 总览】本函数是"算 Q/K/V 并落到 KV 池"的唯一入口。
+    #   A. 选 QKV 路径：融合 norm+RoPE+写 KV，还是逐段 —— 块 1 / 块 2
+    #   B. V4.1 的 C1/C2 source 层额外跑压缩器与 indexer —— 块 3 / 块 3'
+    #   C. HCU 上发起 LayerSplit 预取（与 Q 投影重叠）—— 块 4
+    #   D. 返回 (q, kv)：kv 非 None 表示"还没写"，由 backend 在 attention 内写
+    #
+    #   ★ 压缩器在 CP 下读的是 all-gather 后的全序列（每个 rank 各写一份完整状态），
+    #     这是"CP 不省 KV"的来源；真正省显存的是 LayerSplit。
+    #     而 indexer 只算本地 query 行，才是 CP 提速的主要来源。
     def _forward_prepare(
         self,
         x: torch.Tensor,
@@ -2038,6 +2047,10 @@ class MQALayer(MqaAttentionBase):
             or (not unified and self.use_fused_qk_norm_rope)
         )
 
+        # 【块 1】融合路径：一次 kernel 完成 QKV 投影 + QK-norm + RoPE + 写 KV 池。
+        #   HCU 生产形态走这条；写入在 kernel 内部完成，所以返回的 kv=None。
+        #   里面再按平台/量化形态分几个 arm（gfx95 / gfx1250 / unified），彼此只在
+        #   buffer 布局上有差别，语义一致。
         if do_fused_qk_norm_rope:
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
@@ -2203,6 +2216,8 @@ class MQALayer(MqaAttentionBase):
             kv = None
             if q_out is not None:
                 q_out.copy_(q)
+        # 【块 2】非融合路径：逐段做投影 / norm / RoPE，KV 可能留给 backend 在
+        #   attention 时统一写（此时返回值 kv 非 None）。
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip and not _is_hcu:
@@ -2275,6 +2290,11 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
+        # 【块 3】V4.1 的 C1/C2 source 层：压缩器与 indexer 在注意力之前跑（块 B）。
+        #   两者共用入口 forward_low_ratio_sources，内部再按是否 CP 分流：
+        #     · 压缩器：CP 下先 all-gather 成全序列再压缩，每 rank 各写一份完整状态
+        #     · indexer：只对本地 query 行打分，随 CP 摊薄
+        #   图捕获且 backend 支持低压缩比图时走 BCG 版本。
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
         ):
@@ -2292,6 +2312,8 @@ class MQALayer(MqaAttentionBase):
                     positions=positions,
                     forward_batch=forward_batch,
                 )
+        # 【块 3'】非 C1/C2 层（V4 Pro 的 C4/C128，或 ratio 0）：
+        #   indexer 与 core compressor 分别调用；NPU 的 CP 需要额外的全元数据上下文。
         else:
             use_npu_cp_full_metadata = use_cp and _is_npu
             if self.indexer is not None:
@@ -2380,10 +2402,15 @@ class MQALayer(MqaAttentionBase):
         #
         # DSpark 介入点：输出会额外产出 draft 需要的 hidden（见模型层捕获）。
         # ==================================================================
+        # 【块 0】本层是否走 LayerSplit 路径：池是 LS 池 且 当前是 CP extend。
+        #   为真 → 后面会出现"发起取数 / 等待取数"，非 owned 层的 K buffer 来自 staging。
+        #   本判定只在本函数内使用，其它地方（模型层/调度层）都感知不到 LS。
         layer_split_prefill = (
             is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
             and forward_batch.forward_mode.is_context_parallel_extend()
         )
+        # 【块 1】空批早退。LS 是例外：CP extend 下即使本 rank 一个 token 都没有，
+        #   也必须继续走集合通信，否则 all-reduce / broadcast 的调用序会与其他 rank 错位。
         if (
             not get_attn_tp_context().input_scattered
             and x.shape[0] == 0
@@ -2398,6 +2425,11 @@ class MQALayer(MqaAttentionBase):
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
+        # 【块 2】prepare 路径三选一（互斥）：
+        #   · enable_multi_stream    ：通用多流（写 KV 融进 K kernel，无 bf16 中间态）
+        #   · low_ratio_multi_stream ：C1/C2 层在支持多流的架构上的专门路径
+        #   · 否则                    ：_forward_prepare（最通用，唯一带 LS 预取钩子的一条）
+        #   两条多流路径都不带 unified_kv 分支，也不会发起 LS 预取。
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
@@ -2439,6 +2471,10 @@ class MQALayer(MqaAttentionBase):
             is_unified_kv_triton,
         )
 
+        # 【块 3】unified_kv 的三种形态（同一池布局、不同读写 ABI）：
+        #   unified_fp8_decode  ：decode/idle 或 verify，读环上的 fp8 行
+        #   unified_fp8_prefill ：prefill，读本 chunk 的 packed Q/K
+        #   非 unified          ：常规 bf16 路径（HCU 生产形态走这条）
         unified = is_unified_kv_triton()
         unified_fp8_verify = (
             unified
@@ -2477,6 +2513,11 @@ class MQALayer(MqaAttentionBase):
                 "SGLANG_DSV4_UNIFIED_KV_FP8=0."
             )
 
+        # 【块 4】为 Q 分配输出缓冲，三种布局：
+        #   · V4.1 + uniform_fp8 + 头数在支持集合内 → 直接按 fp8 分配，省一次转换
+        #   · unified_kv（decode/prefill）          → 按池的 row stride 分配
+        #   · 其他                                  → 可能按 kernel 头数 padding，
+        #       被 padding 的头必须清零，否则脏数据会被注意力 kernel 读进去。
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
         if (
@@ -2544,6 +2585,9 @@ class MQALayer(MqaAttentionBase):
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
+        # 【块 5】LS 预取能否与 Q 投影重叠（仅 HCU + V4.1 + CP 生效 + C1/C2 层 + 非图捕获）：
+        #   为真 → 预取在 _forward_prepare 内部就发起，主流继续算 Q（真正的重叠）
+        #   为假 → 预取推迟到块 8 之前，紧接着就要等待，等于串行
         overlap_layer_split_prefetch = (
             _is_hcu
             and self.is_dsv41
@@ -2555,6 +2599,9 @@ class MQALayer(MqaAttentionBase):
             and not is_in_breakable_cuda_graph()
         )
 
+        # 【块 6】prepare 三分支（对应块 2 的判定），三条都会写 KV。
+        #   返回值 kv 的语义：非 None 表示"KV 尚未写入"，交给 attention backend 写；
+        #   None 表示写入已经融进 prepare 的 kernel。
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
@@ -2610,6 +2657,8 @@ class MQALayer(MqaAttentionBase):
                 overlap_layer_split_prefetch=overlap_layer_split_prefetch,
             )
 
+        # 【块 7】unified_kv 下 CP 需要把 packed KV 物化成可见的 noPE/RoPE 两半，
+        #   否则 attention 与 all-gather 读到的是未拆包的中间态。
         if unified_fp8_prefill and is_cp_active(forward_batch):
             # kv is the packed noPE half the fused prefill store left on the kv slot.
             kv, k_rope = _materialize_cp_unified_fp8_kv(
@@ -2643,6 +2692,9 @@ class MQALayer(MqaAttentionBase):
             if x.shape[0] == 0 and not get_attn_tp_context().input_scattered:
                 return x
 
+        # 【块 9】谁负责写 KV：
+        #   kv 非 None → backend 在 attention 内按因果位置写（例如 target-verify、DSA-CP）
+        #   kv 为 None → prepare 已写完，这里传 q 只是满足 k is v 断言，attention 不会读它
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
         # done inline, so the backend skips its own store_cache; pass `q` as a
@@ -2665,6 +2717,11 @@ class MQALayer(MqaAttentionBase):
             if _is_hip
             else None
         )
+        # 【块 10】注意力本体。两条 ABI：
+        #   unified   ：q_rope/k_rope/inv_rope 作为关键字参数传入（仅 HIP radix 后端消费）
+        #   非 unified：常规路径；图捕获时改走 BCG 版本
+        #   ★ attention 读的就是 KV 池：非 owned 层由池内部翻译成 staging 下标，
+        #     所以这里看到的 buffer 可能不是本 rank 自己算出来的结果。
         if unified:
             # only the HIP radix backend takes these; passing them always would
             # leave non-ROCm depending on the **_ in its forward() to drop them, and
@@ -2717,6 +2774,8 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
+        # 【块 11】输出投影（wo_a）阶段：可把 inverse RoPE 与 per-token 量化融进同一个 kernel。
+        #   与 KV 存储无关，但与"尾段"有关——bounded replay 下这里的行数只是每请求的尾行。
         if (
             self.wo_a_fp8
             and _wo_a_fp8_mxscale_fused_invrope is not None
@@ -3436,8 +3495,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         #   · DSpark    ：本层若在捕获集合中，模型层会在层返回后取出 hidden
         #                 （见 DeepseekV4Model.forward 的捕获分支）
         # ==================================================================
+        # 【块 0】本层是否启用跨层 mHC 融合。
+        #   融合时：上一层的 hc_post 与本层的 hc_pre 合成一次 kernel，
+        #   并把状态 (residual, post, comb) 延迟给下一层消费（见块 5）。
         use_fused = self.use_fused_mhc_post_pre
 
+        # 【块 1】注意力之前的 mHC 边界（融合路径）。
+        #   一次 kernel 完成：上一层 hc_post（通道混合 + 残差）＋本层 hc_pre
+        #   （Sinkhorn 权重 + 输入归一化）。fused 返回 None 表示当前形状/后端
+        #   不支持，退回块 1' 的逐段执行——两条路径数学等价。
         if prev_residual is not None and use_fused:
             # Dispatch cascade: aiter HIP (gfx95) -> Triton (gfx95 small-batch
             # <=64 tokens, or gfx1250 all sizes) -> TileLang -> None.
@@ -3494,6 +3560,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
                 else:
                     x_quant = None
+        # 【块 1'】非融合路径：只做本层 hc_pre（上一层的 hc_post 已在上一层返回前完成）。
         else:
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
@@ -3512,6 +3579,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
+        # 【块 2】注意力本体 = MQALayer.forward。
+        #   整条 forward 里唯一与 KV 打交道的入口，四件事都在里面：
+        #     · 写 KV：SWA 写本地行；ratio 1/2 的 source 层还要跑压缩器
+        #     · LayerSplit：发起取数（overlap 时在此之前的 Q 投影阶段发起）
+        #     · LayerSplit：等待取数（attention 之前必须就绪）
+        #     · 读 KV：由池把"非 owned 层"翻译成 staging buffer
+        #   maybe_use_decode_attn_tp 只在 decode 阶段切 attention 的 TP 组，prefill 不干预。
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 x=hidden_states,
@@ -3520,6 +3594,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x_quant=x_quant,
             )
 
+        # 【块 3】FFN 之前的 mHC 边界（与块 1 对称）。
+        #   融合路径一次完成"注意力输出 hc_post + FFN 输入 hc_pre"。
         if use_fused:
             post_attn_norm_weight = (
                 self._post_attention_layernorm_weight_bf16
@@ -3574,6 +3650,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
+        # 【块 4】MoE / dense MLP 本体。
+        #   prefill CP 下，注意力 all-gather 之后每个 rank 手里已是完整 batch，
+        #   所以这里直接按完整 batch 做路由与 DeepEP 派发，不需要额外的 TP 收集。
+        #   注意：这里不承担"省 KV"的职责——省 KV 的是 LayerSplit，不是 MoE。
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
             forward_batch,
@@ -3581,6 +3661,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids_global=input_ids_global,
         )
 
+        # 【块 5】收尾。
+        #   非融合：本层自己完成 hc_post，返回 (hidden, None, None, None)
+        #   融合  ：把 (residual, post, comb) 延迟给下一层，最后一层由模型层补完
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
             return hidden_states, None, None, None
@@ -3689,6 +3772,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         return run_ffn_hc(run_attn_hc(state))
 
+    # 【MoE 入口】本层后半段：MoE（或 dense MLP）+ 必要的 DP 同步。
+    #   三个角色的分工：
+    #     · 路由：用 input_ids / input_ids_global 做专家选择；注意力-DP 下需要全局 id
+    #     · 派发：DeepEP / a2a 按完整 batch 派发（CP 下每个 rank 都有完整 batch，
+    #             所以这里不需要额外的 TP 收集）
+    #     · 归约：专家输出合并，按需做 DP/TP 的 all-reduce
+    #   与 KV 无关：本函数既不读也不写 KV。KV 显存问题全部在注意力侧（LayerSplit）解决。
     def _run_moe_ffn_dp_sync(
         self,
         hidden_states: torch.Tensor,
@@ -4680,6 +4770,10 @@ class DeepseekV4Model(nn.Module):
         local_dspark_aux_hidden_states: List[torch.Tensor] = []
         deferred_mhc_input = None
         mhc_cp_split_done = False
+        # 【块 1】输入准备。
+        #   首 rank：embedding + mHC 通道复制（hidden 变成 [tokens, hc_mult, hidden]）。
+        #     例外：HCU legacy CP 下若马上要切 token，可推迟复制，避免"先复制再切"的浪费。
+        #   非首 rank：从 PP 通道取 hidden（2D），这里 unflatten 回 3D mHC 形状。
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4723,6 +4817,10 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
+        # 【块 2】构造 input_ids_global。
+        #   注意力-DP 且 MoE 不走 a2a 时，各 rank 只有局部 token，但 MoE 路由与 engram
+        #   哈希需要全局 token id → 跨 DP 组做一次 replicate gather。
+        #   用 replicate 而不是 sum：attn_tp>1 时同一 id 会被重复持有，求和会重复累加。
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
@@ -4751,6 +4849,11 @@ class DeepseekV4Model(nn.Module):
 
         # PD disaggregation drives the capture set per batch; fall back to the
         # model-level set for the non-disaggregated path.
+        # 【块 3】确定 DSpark 捕获集合。
+        #   PD 分离时由 batch 下发（P 侧知道要捕获哪些层给 D 侧 draft），否则用模型级配置。
+        #   capture_dspark 为真之后有两处影响：
+        #     · 每个命中层在层返回后取 mean 存 hidden（见块 5 的循环体）
+        #     · 整批禁用 TBO（重叠执行拿不到逐层完成的 hidden）
         dspark_layers_to_capture = getattr(
             forward_batch, "pd_hidden_capture_layer_ids", None
         )
@@ -4768,6 +4871,8 @@ class DeepseekV4Model(nn.Module):
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
+        # 【块 4】TBO 判定。TBO 会先按 batch 分区、再切 CP，因此与块 5 的分支顺序耦合：
+        #   走 TBO 时 hidden / positions 的形状假设与 eager 路径不同。
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
         if deferred_mhc_input is not None:
             if not run_tbo:
@@ -4831,6 +4936,11 @@ class DeepseekV4Model(nn.Module):
             )
         last_pre = None
         tail = None
+        # 【块 5】层循环三选一：
+        #   · hc_pre_from_prev_sublayer：跨子层复用的 mHC 方案（不支持 TBO）
+        #   · run_tbo                  ：two-batch-overlap，逐层自包含、无跨层融合
+        #   · 否则                      ：常规 eager 循环（含跨层 mHC 融合）
+        #   三个分支调用同一个 DecoderLayer.forward，差别只在 mHC 边界怎么组织。
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
             hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
@@ -4843,6 +4953,7 @@ class DeepseekV4Model(nn.Module):
                 pd_aux_hidden_states,
                 dspark_layers_to_capture,
             )
+        # 【块 5'】TBO 路径：层内自包含，不做跨层 mHC 融合，所以没有尾部的 hc_post。
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -4905,6 +5016,9 @@ class DeepseekV4Model(nn.Module):
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         # CP v2 partitions the output per rank, so it needs no output re-gather,
         # and TBO never applied the CP split in the first place.
+        # 【块 6】输出是否需要 CP all-gather。
+        #   只有"legacy CP + 非 TBO + 最后一个 PP stage"才需要：
+        #   策略 CP（cp_v2）的输出本就按 rank 分区，TBO 则从未切分过。
         cp_gather_output = (
             use_prefill_cp
             and not cp_v2_active
@@ -4923,11 +5037,15 @@ class DeepseekV4Model(nn.Module):
         ):
             pd_aux_hidden_states = local_dspark_aux_hidden_states
 
+        # 【块 7】DSpark aux 打包：把逐层捕获的 hidden 拼成 draft 可消费的形式。
+        #   打包与转发是两件事——PP 多 stage 时每个 stage 只投影自己的捕获特征。
         if isinstance(pd_aux_hidden_states, AuxHiddenStatePacker):
             pd_aux_hidden = pd_aux_hidden_states.finalize()
         else:
             pd_aux_hidden = pd_aux_hidden_states
 
+        # 【块 8】非最后 stage：把 hidden 与 aux 经 PP 通道转发出去。
+        #   3D mHC 张量必须 flatten 成 2D 才能过 IPC，接收侧在块 1 再 unflatten。
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
             proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
@@ -4946,6 +5064,8 @@ class DeepseekV4Model(nn.Module):
                     )
             return PPProxyTensors(proxy_tensors)
 
+        # 【块 9】最后一个 stage 的收尾：hc_head（把多通道合并）+ 最终归一化。
+        #   之后交给 ForCausalLM 出 logits；bounded replay 下这里的行数只是每请求尾行。
         pre_hc_head = hidden_states.flatten(1)
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
@@ -4960,6 +5080,10 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
         # HCU prefill CP left the decoder tail rank-local: gather it under its own
         # layout, which yields the tail rows in global order.
+        # 【块 10】legacy CP 的尾段 gather 特例。
+        #   晚层只算了本 rank 的尾行，各 rank 的尾行数与 padding 都不相同，
+        #   必须用"尾段自己的 cp_metadata"（而不是整批的）来 gather，
+        #   才能还原成全局尾序；用错元数据会导致行顺序错位。
         hcu_cp_tail = (
             cp_gather_output and tail is not None and tail.cp_metadata is not None
         )
@@ -5310,6 +5434,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # 【块 A】多模态入口：有图像时把 image token 换成 embedding。
+        #   之后本层以下的逻辑不区分文本/图像——图像行只是"特殊的 hidden"。
+        #   注意它会影响 engram 哈希与 MoE 路由（下面的 mask_fill 把图像 pad id
+        #   还原成 image_token_id）。
         if (
             self.vision is not None
             and not forward_batch.forward_mode.is_decode()
@@ -5330,6 +5458,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
 
+        # 【块 B】legacy CP 的元数据就在这里生成（模型层唯一一处）。
+        #   为什么不在模型主干里做：prefill CP 的元数据要基于"整批 token"构造，
+        #   而主干拿到的已经是本 rank 视角的 batch。
+        #   三个要点：
+        #     · can_dsa_cp_split 决定这一批能不能切（长度需可被 cp_size 整除）
+        #     · round-robin 切法下要 apply_cp_reindex 重排 core 元数据，
+        #       并重建 indexer 元数据（因为页表变了）
+        #     · 若开了 decoder bounded replay，尾段元数据是在切分前构造的，
+        #       必须用 convert_late_layer_tail_to_hcu_cp 转成 CP 布局；
+        #       不支持转换的后端直接报错，而不是静默用错布局
         if not enable_cp_v2() and self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
@@ -5369,10 +5507,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                         "(interleave) HCU prefill CP split"
                     )
 
+        # 【块 C】进入模型主干（DeepseekV4Model.forward）。
+        #   maybe_input_scattered 描述"输入是否已按 TP/CP 打散"，
+        #   决定主干里是否还要做切分与 gather（见主干的块 2 与块 6）。
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        # 【块 D】非最后 PP stage 只返回 hidden；最后 stage 走 logits。
+        #   logits_from_body_output 同时承担 DSpark aux 与 PD aux 的契约，
+        #   所以任何自研 runner（含 CP-v2 / BCG）都必须走它，不能自己写一份。
         if not self.pp_group.is_last_rank:
             return hidden_states
         return self.logits_from_body_output(input_ids, hidden_states, forward_batch)

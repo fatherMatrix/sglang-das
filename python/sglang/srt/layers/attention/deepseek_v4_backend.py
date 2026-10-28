@@ -2722,6 +2722,14 @@ class DeepseekV4AttnBackend(
             ─────────────────────────────────────────────────────────────────────
             .local_index              (21,) int64               apply_cp_reindex  我取 A 的哪 21 行
             .gather_index             (165,) int64              尾段 all-gather   第 i 行在 B 的第几格
+                                      ★ 为什么是 165 而不是 21：
+                                        它按【全部尾行】生成（每行一个地址），
+                                        因为 all-gather 的目标是还原【整段尾序】，
+                                        供压缩器按全局顺序写压缩状态。
+                                        "只看本 rank 的 21 行"是 local_index 的活，
+                                        两者长度天然不同：165 vs 21。
+                                        （168 个格里只有 165 格被指向，
+                                          另外 3 格是空白行，永远不被取。）
             .per_rank_actual_token    [21]*8                    集合通信          每块统一 21 行
             .per_rank_logical_token   [21,21,21,21,21,20,20,20] MoE token 计数    真实行数
             .total_seq_lens           165                       日志/元数据       真实行总数

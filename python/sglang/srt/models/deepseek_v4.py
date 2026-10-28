@@ -5659,9 +5659,25 @@ class DeepseekV4ForCausalLM(nn.Module):
                     core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
                         # ③ 重建 indexer 元数据（不是切片）。
-                        #   因为它的 page_table 是 core 页表经 expand_index_page_table
-                        #   按 64-slot 粒度展开的，compressed_seq_lens 又是按请求算的压缩长度，
-                        #   两者都随行集合变化 → 只能用新的 core_meta 重新构造。
+                        #
+                        #   【它是什么】indexer 打分需要的"压缩域块表 + 压缩长度"：
+                        #     page_table           按压缩比把 full-page 展开成 indexer-K 池
+                        #                          的 64-slot 块（expand_index_page_table）
+                        #     compressed_seq_lens  每请求"已完成压缩组的个数"
+                        #   两者都由 core 的 per-token 字段推导，行集合一变就失效，
+                        #   所以只能拿新的 core_meta 重新构造，不能切片。
+                        #
+                        #   ★ 【V4.1 上这一步是 no-op】
+                        #   这里的 metadata.indexer_metadata 是 ratio-4 那一份，由
+                        #   init_forward_metadata_prefill 里的 has_c4 决定，而 V4.1 的
+                        #   present_ratios 是 {1,2} → has_c4 为 False → 恒为 None，
+                        #   本分支根本不会进。
+                        #   V4.1 的 prefill 走 dense candidate 路径
+                        #   （_low_ratio_index_topk_dense）：直接用 core 的 page_table 与
+                        #   sparse_page_indices / sparse_raw_indices，不需要这份块表。
+                        #   V4.1 的 c1/c2_indexer_metadata 只存在于 decode 与 prefill
+                        #   图捕获两个场景，且**不在这里重建**（LS 校验强制 prefill
+                        #   graph 关闭，所以这个组合不会出现）。
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )

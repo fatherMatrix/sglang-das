@@ -1765,6 +1765,35 @@ class DeepseekV4AttnBackend(
             online_state_slot_offset=online_c128_state_slot_offset,
         )
 
+    # ==================================================================
+    # init_forward_metadata_indexer —— 把 core 元数据翻译成"indexer 打分视角"
+    #
+    # 【解决的问题】
+    #   core 元数据是"每 token 行 + 全精度页号"，而 indexer 打分要的是
+    #   "压缩域的块表 + 压缩长度"：它按压缩比 r 把 r 个 token 当一个条目，
+    #   indexer-K 池还可能按更小的粒度分页。两者粒度不同，不能直接复用，
+    #   这里做一次转换，产出 PagedIndexerMetadata。
+    #
+    # 【三种 ratio 的差异】
+    #   · ratio 4（V4 Pro / DeepSeek V4）：压缩长度直接取 c4_topk_lengths_raw，
+    #     压缩页大小 = page_size // 4。
+    #   · ratio 1 / 2（V4.1 Flash）：压缩长度取 c1/c2_topk_lengths_clamp1；
+    #     ★ indexer-K 池按 64 slot 分页（get_index_k_page_size），比
+    #     page_size // ratio 更碎，所以页表必须经 expand_index_page_table
+    #     把"一个 full page"展开成"若干个 64-slot 块"。
+    #   · 其它比例直接报错（当前没有实现）。
+    #
+    # 【三个使用场景 —— 决定了它什么时候被调用】
+    #   ① decode：init_forward_metadata 里对 c1 / c2 各建一次（每个 step 一次）。
+    #   ② prefill + 图捕获：走 _low_ratio_prefill_indexer_metadata，额外截断
+    #      num_pages（_prefill_graph_max_seq_len）并带 row_chunk 保证图形状稳定。
+    #   ③ prefill 非图捕获：★ 不构造。V4.1 走 dense candidate 路径
+    #      （_low_ratio_index_topk_dense），直接用 core 的 page_table 与
+    #      sparse_page_indices / sparse_raw_indices，不需要这份压缩域块表。
+    #   这也是为什么 V4.1 在 prefill 上看到 indexer_metadata 恒为 None：
+    #   init_forward_metadata_prefill 里那份 ratio-4 的 indexer_metadata 由
+    #   has_c4 决定，而 V4.1 的 present_ratios 是 {1,2}，has_c4 为 False。
+    # ==================================================================
     def init_forward_metadata_indexer(
         self,
         core_attn_metadata: DSV4AttnMetadata,
@@ -1773,10 +1802,19 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         rows_per_request: int = 1,
     ):
+        # 起点是 core 的页表（每行=该 token 所属请求的 full-page 列表）。
+        # ratio 4 时它就是最终块表；ratio 1/2 时下面要按 indexer-K 的页大小重排。
         page_table = core_attn_metadata.page_table
         index_page_size = 0
         if compress_ratio == 4:
             c_seq_lens = core_attn_metadata.c4_topk_lengths_raw
+        # 【V4.1 走这里】ratio 1/2 分支。
+        #   c_seq_lens 用 clamp1 版本：每请求"已完成压缩组的个数"（clamp 到下限 1），
+        #   这是 indexer 能打分的压缩位置上限。
+        #   紧接着的 expand_index_page_table 把 full-page 页号乘上 blocks_per_page 再
+        #   补偏移，等价于：kernel 读第 j 个压缩 slot 时，用
+        #   page_table[b, j // index_page_size] * index_page_size + j % index_page_size
+        #   去寻址 —— 展开后这个式子的结果正好是该位置在 c1/c2 index-K 池里的 slot。
         elif compress_ratio in (1, 2):
             c_seq_lens = (
                 core_attn_metadata.c1_topk_lengths_clamp1
@@ -1796,6 +1834,12 @@ class DeepseekV4AttnBackend(
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
+        # 打包成 PagedIndexerMetadata。三个字段值得注意：
+        #   · compressed_page_size：ratio 4 是 page_size//4；V4.1 是 indexer-K 的 64
+        #   · use_topk_v2：HCU 恒 False（dsa_topk_backend 写明 "topk_v2 has no HCU
+        #     kernel"），所以 HCU 永远走 paged transform，不会走 v2 的按行路由计划
+        #   · force_deep_gemm_metadata：SM120 的 FP4 kernel 用 split_kv=128，
+        #     而通用 JIT 规划器按 256 编码，需要强制改规划
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size or self.page_size // compress_ratio,

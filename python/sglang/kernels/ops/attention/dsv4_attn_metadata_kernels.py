@@ -486,9 +486,31 @@ def late_layer_tail_layout(
     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
     if len(extend_lens_cpu) == 1:
         # ---- 单请求快路径：尾段就是 extend 的最后 t 行，可以零拷贝构造 ----
+        # 先把三个长度取出来（都是 Python int，不产生任何设备操作）：
+        #   n = 本 chunk 的 extend 行数（这个请求要新算多少 token）
+        #   t = 尾长 = min(tail_len, n)（不足一个窗口就全取）
+        #   s = seq_len = prefix_len + n（含历史的绝对总长）
+        #
+        # 只有一个请求时，"批内行号"就等于"它自己的行号"：0 .. n-1
+        # 对应的绝对位置是 [s-n, s-1]（extend 紧接在 prefix 之后）。
+        #   ★ 尾段 = 最后 t 行  →  行号 [n-t, n-1]
+        #                      →  位置 [s-t, s-1]
+        #   所以尾段第一行的【绝对位置】= s - t，这就是窗口下界 floor。
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
-        # floor 对所有行相同（同一请求），= 尾段第一行的绝对位置。
+
+        # floor = 长度 t、每个元素都是 (s - t) 的 int32 张量。
+        #   为什么是"每行一个"而不是一个标量？
+        #     下游的 swa_replay_start 是按行消费的张量（每行给自己的窗口下界）；
+        #     而同一请求内所有行的下界相同，所以就是同一个常数复制 t 份。
+        #   int32 是为了对齐 kernel 的入参 ABI。
+        #   语义：该行能回看的最早绝对位置，保证窗口不越过尾段起点
+        #        （尾段之前的 SWA 行这一次根本没写过，读了就是脏数据）。
         floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
+
+        # arange(n-t, n) = [n-t, n-t+1, ..., n-1]：跳过前 n-t 行，只取最后 t 行。
+        #   · n=200, t=128 → 72..199（跳过前 72 行）
+        #   · n=50,  t=50  → 0..49   （短 extend：整段都是尾段，不跳过任何行）
+        # 交付顺序与多请求分支一致：(token_indices, tail_lens_cpu, floor)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
     # ---- 多请求：一次 H2D 拿三组长度，其余全在设备上推导 ----
     # One H2D copy for the three length vectors; launch count does not grow with bs.

@@ -1146,6 +1146,30 @@ class DSV4AttnMetadata:
             )
 
     def init_flashmla_related(self, is_prefill: bool = False, low_ratio_buffers=None):
+        """重建"稀疏 prefill"的工作区与调度元数据（派生缓冲区）。
+
+        【解决的问题】
+        V4.1 prefill 不做 dense attention。每层先由 indexer 给每个 query token 选
+        top-k（k = index_topk，512 或 1024），把选中的压缩页与该请求自己的 SWA
+        窗口反量化汇聚到一块紧凑 bf16 workspace ((total_rows, 512))，再在这块
+        workspace 上跑 flash_mla_sparse_fwd。所以要有一份"每行看哪 512 个位置"
+        的清单，以及 FlashMLA 的 SM 调度方案 —— 本函数负责把它们建出来/重建出来。
+
+        【建的是什么】
+          sparse_topk_lengths   每行有效长度（clamp 到 index_topk）
+          sparse_page_indices   (rows, index_topk) int32，合并索引：
+                                [压缩区 top-k | SWA 窗口 | -1 填充]，
+                                末维按 PAGE_INDEX_ALIGNED_SIZE(64) 对齐，
+                                因为 flash_mla_sparse_fwd 要求 topk % B_TOPK == 0
+          sparse_raw_indices    同形状中转缓冲，仅 prefill 需要
+                                （decode 的索引可由 page table 直接算，无需 combine）
+          *_flashmla_metadata   flash_mla.get_mla_metadata()，按长度/行数算出的调度
+
+        【为什么叫派生 / 为什么必须在 apply_cp_reindex 之后】
+          这些张量的第 0 维 = 行数，内容由 topk_lengths / page_table / seq_lens
+          推导而来，不是独立数据。CP 切片后行数变成 N/cp_size，若在切片前调用，
+          就会按整批 N 行分配：内存浪费 cp_size 倍，且 FlashMLA 调度按错的行数算。
+        """
         assert self.index_topk in (512, 1024), (
             f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"

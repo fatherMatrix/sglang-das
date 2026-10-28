@@ -5612,10 +5612,34 @@ class DeepseekV4ForCausalLM(nn.Module):
                     #   而写 KV 的落点（*_out_loc）【故意不切】：压缩器要按全局 token 顺序
                     #   写整段压缩状态（每个 rank 各写一份），切了就会写错位置。
                     core_meta.apply_cp_reindex()
-                    # ② 重建稀疏 prefill 的派生缓冲区。
-                    #   它按 topk_lengths.size(0)（= 当前行数）分配 sparse_page_indices，
-                    #   并额外开一份 raw_indices 供 prefill 用。
-                    #   ★ 必须在 ① 之后：否则尺寸按整批算，与本 rank 的行数不符。
+                    # ② 重建"稀疏 prefill"的工作区（派生缓冲区）。
+                    #
+                    #   【它解决什么问题】
+                    #   V4.1 的 prefill 不走 dense attention：每层先用 indexer 给每个
+                    #   query token 打 top-k（k = index_topk，512 或 1024），把选中的
+                    #   压缩页 + 自己的 SWA 窗口一起反量化汇聚到一块紧凑 bf16 workspace
+                    #   ((total_rows, 512))，再在这个 workspace 上跑 flash_mla_sparse_fwd。
+                    #   "这一行到底看哪 512 个位置"必须显式写下来 —— 这些表就是那份清单。
+                    #
+                    #   【涉及的基础设施】
+                    #   · sparse_page_indices (rows, index_topk) int32：每行一份合并索引
+                    #       [压缩区 top-k 索引(已 rebase) | SWA 窗口索引(已 rebase) | -1 填充]
+                    #     由 dsv4/sparse_prefill_utils.combine_topk_swa_indices 生成
+                    #     （HCU 上有 LightOp 融合版 combine_topk_swa_indices_hcu）
+                    #   · sparse_raw_indices：同形状的中转缓冲，只有 prefill 需要
+                    #     （decode 的索引能由 page table 直接算，不需要 combine）
+                    #   · sparse_topk_lengths：每行实际有效长度（clamp 到 index_topk）
+                    #   · *_flashmla_metadata：FlashMLA 的 SM 调度方案
+                    #     （flash_mla.get_mla_metadata()），按长度与行数算出
+                    #   · 末维按 64 补 -1：flash_mla_sparse_fwd 要求 topk % B_TOPK == 0
+                    #     （h_q=64 用 64、h_q=128 用 128）→ PAGE_INDEX_ALIGNED_SIZE = 64
+                    #
+                    #   【为什么叫"派生"、为什么必须在 ① 之后】
+                    #   它们的第 0 维就是行数、内容由 topk_lengths / page_table 推出，
+                    #   不是独立数据。CP 切完行数变成 N/cp_size：
+                    #     若按整批 N 分配 → 内存浪费 cp_size 倍，且 FlashMLA 的调度
+                    #     是按行数算的，形状不对就会读到未初始化区域。
+                    #   所以顺序必须是"先 ① 切片、再 ② 重建"。
                     core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
                         # ③ 重建 indexer 元数据（不是切片）。

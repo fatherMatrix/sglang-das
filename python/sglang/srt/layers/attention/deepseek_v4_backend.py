@@ -2552,28 +2552,97 @@ class DeepseekV4AttnBackend(
         token_indices: torch.Tensor,
         tail_lens: torch.Tensor,
     ) -> dict:
+        """把"整批尾段"改写成"本 rank 的尾段 + 全 rank 等长布局"。
+
+        ==================================================================
+        为什么需要它
+        ==================================================================
+        晚层尾部（bounded replay 的 tail）是按**整批行号**描述的。CP 切分之后：
+          · 本 rank 只该处理 t % cp_size == cp_rank 的那些行；
+          · 但各 rank 分到的行数不一定相等（total 未必被 cp_size 整除，
+            而且不同请求的尾长可能不是 128）。
+        而尾段在跑的时候要参与集合通信（all-gather 还原全局尾序）、
+        形状必须所有 rank 一致。于是需要：
+          ① 选出本 rank 的行；
+          ② 用私有填充行补到 max_local 行，使形状统一；
+          ③ 给出一个索引，让 all-gather 之后能把 rank-major 的顺序
+             还原成"全局尾序"。
+
+        ==================================================================
+        三个坐标系（最容易搞混的地方）
+        ==================================================================
+          global row      0 .. total-1
+                          整批尾行号（token_indices 的值域是 extend 行号，
+                          这里用的是它在 tail 数组里的下标）
+          padded 空间     0 .. cp_size*max_local-1
+                          rank-major 的"等长块"拼起来的虚拟缓冲：
+                            [0, total)                      真实尾行
+                            [total+off_r, +pad_r)           各 rank 私有的填充行
+                          off_r = Σ_{k<r} pad_k，所以各 rank 的填充区互不重叠，
+                          并且 total + Σ pad = cp_size * max_local ✔
+          local row       0 .. max_local-1
+                          本 rank 自己那块的局部行号（送入 attention 的张量行号）
+
+        ==================================================================
+        算例（cp_size=8，单请求 extend=50 → 整段都是尾段，total=50）
+        ==================================================================
+          counts        = [7,7,6,6,6,6,6,6]   max_local = 7
+          padded 空间    8×7 = 56 = 50 + Σpad(6)   ✔
+          rank2 的
+            local_index   = [2,10,18,26,34,42, 50]   ← 前 6 个是真实行，
+                                                        50 是它自己的填充行
+            gather_index  = [14..19]                 ← 落在 rank-major 的第 2 块
+
+        ==================================================================
+        返回的 6 项
+        ==================================================================
+          cp_metadata        InterleaveContextParallelMetadata，塞进
+                             forward_batch.attn_cp_metadata 供 all-gather 消费；
+                             其中 local_index 又被 apply_cp_reindex 当作行选择器
+          local_token_indices 本 rank 尾行的【局部 extend 行号】
+                             = (global_row - cp_rank) // cp_size
+          local_positions    本 rank 尾行的绝对位置（补齐到 max_local）
+          local_lens(_cpu)   本 rank 每请求各有几行（求和 = counts[cp_rank]）
+          pad_rows           本 rank 需要补几行
+        """
         cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size
         device = token_indices.device
         total = token_indices.shape[0]
+        # ---- ① 归属：round-robin 的规则就是 t % cp_size ----
+        # token_indices 是【extend 行号】，而 CP 切分也是按 extend 行号做的，
+        # 所以取模即得 owner，不需要额外映射。
         owner_rank = token_indices % cp_size
         counts = torch.bincount(owner_rank, minlength=cp_size).tolist()
         max_local = max(counts)
+        # ---- ② 算 gather_index：全局行号 → rank-major 打包槽位 ----
+        # order 是按 owner 稳定排序后的行下标（同 rank 内保持原顺序）。
         order = torch.argsort(owner_rank, stable=True)
+        # rank_starts[r] = rank r 的组在排序后数组里的起始位置。
         rank_starts = torch.tensor(
             [sum(counts[:r]) for r in range(cp_size)],
             dtype=torch.int64,
             device=device,
         )
+        # slot：每个行在【自己 rank 组内】的偏移（0..counts[r]-1）。
+        #   排序后的位置 arange(total) 减去本组起点，再 scatter 回原行序。
         slot = torch.empty_like(owner_rank)
         slot[order] = (
             torch.arange(total, device=device) - rank_starts[owner_rank[order]]
         )
+        # 打包槽位 = 块起点(rank*max_local) + 组内偏移。
+        # all-gather 的输出就是 rank-major 等长块，所以
+        # output_tensor[gather_index] 正好还原成全局尾序。
         gather_index = owner_rank * max_local + slot
 
+        # ---- ③ 本 rank 的行选择器 local_index ----
         local_tail_rows = (owner_rank == cp_rank).nonzero().squeeze(1)
         pad_rows = max_local - counts[cp_rank]
         # Give each rank distinct padding rows in the compact tail metadata.
+        # 填充行号从 total 之后开始，并按前面各 rank 的 pad 总量错开，
+        # 保证每个 rank 的填充区互不重叠（总和恰好填满 cp_size*max_local）。
+        # 这些行在 padded 空间里是"执行 padding"，内容为零、不会被任何 query 读到，
+        # 它们存在的唯一目的是让每个 rank 的形状都等于 max_local。
         pad_start = total + sum(max_local - c for c in counts[:cp_rank])
         local_metadata_rows = torch.cat(
             [
@@ -2581,17 +2650,23 @@ class DeepseekV4AttnBackend(
                 torch.arange(pad_start, pad_start + pad_rows, device=device),
             ]
         )
+        # ---- ④ 每行属于哪个请求（用于算 local_lens）----
+        # 展开成每行一个 request id，行序与 token_indices 一致。
         tail_request_ids = torch.repeat_interleave(
             torch.arange(forward_batch.batch_size, device=device),
             tail_lens.to(torch.int64),
             output_size=total,
         )
+        # ---- ⑤ 本 rank 的行位置（真实行 + 补零到 max_local）----
         local_positions = torch.cat(
             [
                 forward_batch.positions[token_indices[local_tail_rows]],
                 forward_batch.positions.new_zeros(pad_rows),
             ]
         )
+        # ---- ⑥ 供 all-gather / reindex 消费的元数据 ----
+        # per_rank_actual_token 取统一值 max_local（形状对齐用），
+        # 真实行数放在 per_rank_logical_token（MoE 的 non-padded 计数要用它）。
         cp_metadata = InterleaveContextParallelMetadata(
             per_rank_actual_token=[max_local] * cp_size,
             max_rank_len=[max_local] * cp_size,
@@ -2601,11 +2676,16 @@ class DeepseekV4AttnBackend(
             gather_index=gather_index,
             local_index=local_metadata_rows,
         )
+        # 本 rank 每请求有几行：对真实行的 request id 做直方图。
+        # Σ local_lens = counts[cp_rank]（填充行不参与统计）。
         local_lens = torch.bincount(
             tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
         )
         return dict(
             cp_metadata=cp_metadata,
+            # 全局 extend 行号 → 本 rank 的局部行号：
+            #   t ≡ cp_rank (mod cp_size)，本 rank 的第 k 行就是 t = cp_rank + k*cp_size
+            #   所以 k = (t - cp_rank) / cp_size
             local_token_indices=(token_indices[local_tail_rows] - cp_rank) // cp_size,
             local_positions=local_positions,
             local_lens_cpu=local_lens.tolist(),

@@ -2348,6 +2348,31 @@ class DeepseekV4AttnBackend(
         正常 prefill 的批 = 所有 token；晚层（late_layer_start 之后）只需要每请求
         最后 SWA_WINDOW(128) 个 token，于是这里为晚层单独造一份完整的前置元数据。
 
+        ==================================================================
+        ★ 每个 forward 最多被调用【两次】，第二次是覆盖第一次
+        ==================================================================
+          ① init_forward_metadata（runner，进模型之前）
+               条件：开了 bounded replay
+                     and forward_mode.is_extend_without_speculative()
+                     and not skip_late_layers
+               参数：legacy_cp 缺省 False（cp_tail=None）
+               产物：【整批】尾段——此刻 CP 还没切分，行号是整批 extend 的行号
+
+          ② convert_late_layer_tail_to_hcu_cp（模型层 ForCausalLM 块 B）
+               条件：① 已产出 tail_forward_metadata
+                     and 是 round-robin 切法
+                     and can_dsa_cp_split(...) 判定这批真的切了
+               参数：legacy_cp=True
+               产物：【rank-local】尾段，直接替换 ① 的对象（旧对象丢弃）
+
+          所以同一次 forward 里：
+            · 没开 replay / 不是 prefill / mid-chunk → 0 次，tail_forward_metadata 为 None
+            · 开了 replay 但 CP 没切（短批回退）  → 1 次，保持整批语义（本 rank 拥有全部行）
+            · 开了 replay 且 CP 真的切了           → 2 次，第二次覆盖第一次
+          这也是为什么本函数要有 legacy_cp 参数：① 时 is_cp_active() 为 False，
+          必须由 ② 显式告诉它"这批已经是 rank-local 了"。
+        ==================================================================
+
         ------------------------------------------------------------------
         Q1. 产物是"针对 batch"还是"针对 request"？
         ------------------------------------------------------------------

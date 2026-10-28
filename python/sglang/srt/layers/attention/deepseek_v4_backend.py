@@ -2480,15 +2480,40 @@ class DeepseekV4AttnBackend(
             else None
         )
 
-        # 【Q2 ②】关键一步：把尾段当成一个独立的 prefill 批，递归构造完整元数据。
-        #   传进去的都是尾段视角的量：
-        #     out_cache_loc     尾行的写入位置（不是整批）
-        #     num_tokens        sum(tail_lens)
-        #     extend_seq_lens   tail_lens（每请求尾长，不是原 extend 长）
-        #     extend_start_loc  cumsum(tail_lens)-tail_lens（尾段自己的前缀和）
-        #     swa_replay_start  每行窗口下界，让 SWA 窗口不从历史更早处开始
-        #   于是尾段自然获得自己的 page_table / SWA 窗口 / indexer 元数据 ——
-        #   这就是晚层能用一个小批跑完的原因。
+        # 【Q2 ②】关键一步：给尾段【重新造一份完整元数据】。
+        #
+        # ── 先说要解决什么问题 ─────────────────────────────────────
+        #   attention kernel 不认识"请求"，它只认识"一批行"，每行都要问：
+        #       · 我该读哪些 KV 页？      → page_table（每行一行）
+        #       · 我的因果长度/位置多少？  → seq_lens_casual / positions
+        #       · 我的 SWA 窗口从哪开始？  → 窗口元数据（带 floor）
+        #       · 我写 KV 写到哪？        → *_out_loc
+        #   这套东西每个 forward 由 runner 的 init_forward_metadata 按【整批】
+        #   造一次。但晚层要跑的行只是"每请求最后 128 行"，行集合变小了：
+        #   整批元数据的行数是几千，晚层的 x 只有 165 行 —— 直接拿来用会
+        #   行数不匹配、读到非尾行的页、KV 写到错误槽位。
+        #
+        # ── 再讲这一步的"技巧" ───────────────────────────────────
+        #   这个构造函数本质是纯函数：
+        #       (seq_lens, extend_lens, out_cache_loc, ...) → 元数据
+        #   所以不需要为尾段另写一套逻辑，只要【换一套长度参数】再调一次：
+        #
+        #       extend_seq_lens   = tail_lens          改成尾长
+        #       extend_start_loc  = cumsum(tail)-tail  尾段自己的前缀和
+        #       num_tokens        = Σ tail_lens        行数变小
+        #       out_cache_loc     已经是尾行子集（上层用 _tail_rows 取好）
+        #       seq_lens          仍然传【完整】seq_len ← 这点最容易疑惑
+        #
+        #   为什么 seq_lens 要传完整的？因为因果长度是"从 seq_len 往回数 tail 个"：
+        #       尾段第 k 行的因果长度 = seq_len - tail_len + k + 1
+        #   于是这一批的"前缀长度"自然等于 seq_len - tail_len，
+        #   正好等于窗口下界 floor —— 晚层就只会在尾段内部做注意力，
+        #   不会去读尾段之前那些本次没写过的 SWA 行。
+        #
+        # ── 产出 ──────────────────────────────────────────────────
+        #   尾段自己的 page_table / 因果长度与位置 / SWA 窗口（带 floor）/
+        #   只覆盖尾行的写入落点 / （适用时）indexer 元数据。
+        #   晚层拿着这份元数据跑 165 行，就和"单独 prefill 这 165 行"等价。
         metadata = self.init_forward_metadata_prefill(
             max_seq_len=int(seq_lens_cpu.max().item()),
             req_pool_indices=forward_batch.req_pool_indices,

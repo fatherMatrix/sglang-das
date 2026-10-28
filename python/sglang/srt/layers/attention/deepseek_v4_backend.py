@@ -2707,6 +2707,14 @@ class DeepseekV4AttnBackend(
         ★ 这四个数都是【整批聚合】的结果，不是"每请求"的量。
           整批里只有 local_lens 是每请求一个数（见下）。
 
+        【形状记法】括号里带逗号 = 一维张量：
+            (21,)    → 1-D，21 个元素        （torch 里显示 torch.Size([21])）
+            (21, 1)  → 2-D，21 行 1 列       ← 注意与上者的区别
+        写成 (counts[cp_rank],) 是"长度随本 rank 实得行数变化"的意思：
+            rank0..4 的 counts[cp_rank] = 21 → 形状 (21,)
+            rank5..7 的 counts[cp_rank] = 20 → 形状 (20,)
+        所以同一个字段在不同 rank 上形状可能差 1，这正是 pad_rows 存在的原因。
+
         ▸ cp_metadata —— 一个对象，把两张表 + 三个尺寸参数打包给下游。
           逐项看"谁读它、读了干什么"：
 

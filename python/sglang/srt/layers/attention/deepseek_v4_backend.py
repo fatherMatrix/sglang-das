@@ -1232,7 +1232,36 @@ class DSV4AttnMetadata:
 
 class LateLayerTail(msgspec.Struct, frozen=True):
     """Rows the layers after the last kv_source layer run over under decoder SWA
-    bounded replay: the last tail tokens of each request in the extend."""
+    bounded replay: the last tail tokens of each request in the extend.
+
+    ★ 粒度说明（容易误解成"一请求一份"，其实不是）
+    这是【一个批一份】的元数据，内部用"ragged 拼接 + 每请求长度"表达多请求：
+
+      批级 / 每-forward 一份
+        __ 对象本身：每次 init_forward_metadata 重建一次
+        pad_rows / cp_metadata / contiguous_start
+
+      每请求（长度 = num_reqs）
+        extend_seq_lens        (num_reqs,)  int32，每请求的尾长 = min(128, extend)
+        extend_seq_lens_cpu    List[int]，同上
+        local_lens / local_lens_cpu        CP 时：本 rank 每请求的尾行数
+
+      每行（长度 = Σ 尾长，按请求分组、组内保持原顺序）
+        token_indices          尾行在【原 extend】里的行号
+        positions              这些行的绝对位置
+        swa_out_cache_loc      SWA 写落点
+        req_global / pos_global  每行的请求号与位置（CP 压缩/广播用）
+        global_token_indices   CP 时保留的整批行号（DSpark 注入按全局索引）
+
+    例：3 个请求 extend = 1000 / 200 / 50，tail_len = 128
+        extend_seq_lens = [128, 128, 50]        （每请求，长度 3）
+        token_indices   = [872..999, 1072..1199, 1200..1249]   （每行，长度 306）
+    这正是 sglang 里所有"extend 元数据"的通用形态：seq_lens 是每请求，
+    seq_lens_casual 是每 token 行，两者靠 repeat_interleave / cumsum 互相推导。
+
+    contiguous_start 是"批里只有一个请求"时的快路径：此时尾行就是 extend 的
+    最后 n 行，_tail_rows 可以直接切片（view），否则必须按 token_indices gather。
+    """
 
     token_indices: torch.Tensor
     positions: torch.Tensor

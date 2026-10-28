@@ -2287,55 +2287,133 @@ class DeepseekV4AttnBackend(
     def _build_late_layer_tail_metadata(
         self, forward_batch: ForwardBatch, legacy_cp: bool = False
     ) -> DSV4Metadata:
-        # ==================================================================
-        # _build_late_layer_tail_metadata —— decoder bounded replay 的"子批"
-        #
-        # 正常 prefill 的批是"所有 token"；晚层（late_layer_start 之后）只需要
-        # 每请求最后 SWA_WINDOW(128) 个 token，于是这里构造一个"只含尾行"的
-        # 元数据，让晚层用一个更小的批去算。
-        #
-        # 三个关键产物：
-        #   token_indices   ：尾行在原 extend 里的行号（用于切 hidden/Q 等）
-        #   swa_replay_start：每行的窗口下界（floor）—— ★ 决定晚层"能看到多远"
-        #                     floor = seq_len - tail_len，即尾段起点；
-        #                     它保证晚层不会去读"尾段之前、本次没写过的"SWA 行
-        #   out_cache_loc   ：尾行对应的 KV 写入位置（只写这些行）
-        #
-        # 正确性后果（也是 upstream #41303 的由来）：
-        #   晚层的 SWA KV 只有尾行被写。若前缀被别的请求复用，且复用的边界
-        #   不在某次 extend 的尾段上，则那些位置的行从未写过 —— 于是
-        #   swa_reprefill_tail_tokens() 要把匹配末尾 128 token 退回重算。
-        #
-        # CP 交互：cp_tail 是"按本 rank 的 token 切分"后的尾段布局，
-        #   供尾段自己的 all-gather 使用（legacy CP 走 convert_late_layer_tail_to_hcu_cp）。
-        # ==================================================================
+        """构造 decoder bounded replay 的"尾段子批"元数据。
+
+        正常 prefill 的批 = 所有 token；晚层（late_layer_start 之后）只需要每请求
+        最后 SWA_WINDOW(128) 个 token，于是这里为晚层单独造一份完整的前置元数据。
+
+        ------------------------------------------------------------------
+        Q1. 产物是"针对 batch"还是"针对 request"？
+        ------------------------------------------------------------------
+        两种粒度都有，且分工明确——这正是容易被误读的地方：
+
+          批级唯一：对象本身（一个 DSV4Metadata），每次 forward 建一份；
+                    对象里的 core_attn_metadata / indexer 元数据也都是批级容器。
+
+          每请求（长度 = batch_size）：
+            extend_seq_lens / extend_seq_lens_cpu   本批每请求的【尾长】
+                                                    = min(SWA_WINDOW, extend_len)
+            local_lens / local_lens_cpu             CP 时：本 rank 每请求的尾行数
+            （输入侧的 seq_lens / extend_seq_lens_cpu 同样是每请求一个数）
+
+          每行（长度 = Σ尾长，按请求分组、组内保原序）：
+            token_indices       尾行在【原 extend】里的行号
+            positions           这些行的绝对位置
+            swa_replay_start    每行 SWA 窗口下界（floor）
+            out_cache_loc       尾行的 KV 写入位置
+            low_ratio_req_indices / low_ratio_pos_i64
+                                每行的请求号与位置（压缩器/indexer 用）
+            req_global / pos_global / global_token_indices（CP 时）
+
+        为什么必须"批级对象 + ragged 行"而不能"每请求一个对象"？
+          attention kernel / 集合通信 / 图捕获都按【一个批一次调用】设计，
+          批级对象是它们唯一的输入；per-request 的信息用"长度数组 + 拼接行"
+          表达，跟 seq_lens vs seq_lens_casual 是同一套约定。
+
+        ------------------------------------------------------------------
+        Q2. 怎么算出来的？
+        ------------------------------------------------------------------
+          ① late_layer_tail_layout(extend_lens_cpu, seq_lens_cpu, SWA_WINDOW)
+               每请求尾长 = min(128, extend_len)
+               行分组：repeat_interleave(arange(bs), tail_lens) → 每行属于哪个请求
+               行内偏移：arange(total) - (cumsum(tail_lens) - tail_lens)[req]
+               尾行行号：(cumsum(extend_lens) - tail_lens)[req] + 行内偏移
+               floor   ：(seq_lens - tail_lens)[req]   ← 窗口下界锁在尾段起点
+          ② 用 tail_lens 当 extend 长度，递归调用 init_forward_metadata_prefill
+             → 得到一份"整批都是尾行"的完整 prefill 元数据（page_table、SWA
+               窗口、indexer 等全部按尾行重建）
+          ③ 把 tail 专属的字段挂回去：swa_out_cache_loc、low_ratio_*、
+             LateLayerTail（含 CP 布局）
+
+        ------------------------------------------------------------------
+        Q3. 前缀匹配是 page 粒度，向前扣 128 个 token 会破坏这一点吗？
+        ------------------------------------------------------------------
+        不会，因为**前缀匹配本来就不是 page 粒度**：
+          RadixKey(token_ids, limit=key_limit) 是 token 序列（radix trie），
+          命中长度可以是任意 token 数，从来不是页对齐的。
+        页粒度只出现在三个别的地方，且都与"命中长度"解耦：
+          · KV 分配：整页分配，但 alloc_extend 支持从半页续写
+            （last_loc 指向该请求已占用的最后一个 slot，只补新页）
+          · SWA/full 池的 segment 释放：按页对齐回收，末尾整页释放
+          · PD 传输 / LayerSplit 选页：按页搬，边界页整页搬（over-fetch 无害）
+        所以扣 128 只是把命中长度从"某个非对齐值"变成"另一个非对齐值"，
+        不引入新的对齐问题；唯一实际代价是那 128 个 token 要重新分配 slot，
+        可能在边界多用一页——而静态选页的上界里正好有 +1 的边界余量。
+
+        正确性后果（upstream #41303 的由来）：
+          晚层的 SWA KV 只有尾行被写。若前缀被别的请求复用、且复用边界不在
+          某次 extend 的尾段上，那些位置的行就从未写过 —— 于是
+          swa_reprefill_tail_tokens() 要把匹配末尾 128 token 退回重算。
+
+        CP 交互：cp_tail 是"按本 rank 切分"后的尾段布局，供尾段自己的
+          all-gather 使用（legacy CP 由 convert_late_layer_tail_to_hcu_cp 触发）。
+        """
         # Each request contributes only its last SWA_WINDOW extend tokens, with the
         # window floored at the tail start: window KV before it is never written here.
+        # 【输入】两个每请求的 CPU 长度表：本批每请求 extend 了多少 token、
+        #   以及它的历史总长（seq_len）。尾长与 floor 都由这两者推出。
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
         device = forward_batch.out_cache_loc.device
+        # 【Q2 ①】纯 CPU 长度表 → 三个每行/每请求量（不碰 GPU 数据）：
+        #   tail_lens_cpu      每请求：min(SWA_WINDOW, extend_len)
+        #   token_indices      每行：尾行在【原 extend】里的行号（按请求分组、组内保原序）
+        #   swa_replay_start   每行：窗口下界 floor = seq_len - tail_len
+        #                      ★ floor 锁在尾段起点，保证晚层不会去读尾段之前、
+        #                        本次没写过的 SWA 行（这是正确性的关键）
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_cpu.tolist(),
             tail_len=SWA_WINDOW,
             device=device,
         )
+        # 单请求快路径：批里只有一个请求时，尾行就是 extend 的最后 n 行，可以直接
+        # 切片（view）；多请求时必须按 token_indices gather。
+        # 这个值会一路传到 _tail_rows，决定走哪条路。
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
         )
+        # 取尾行的 KV 写入位置 —— 只写这些行。
+        # 这正是晚层 SWA 只有尾行被写的来源，也是 swa_reprefill_tail_tokens()
+        # 必须把匹配末尾退回重算的原因。
         out_cache_loc = _tail_rows(
             forward_batch.out_cache_loc,
             token_indices=token_indices,
             contiguous_start=contiguous_start,
         )
+        # 每请求尾长搬到设备端：既当 extend_seq_lens 传给元数据构造，
+        # 也要用于 repeat_interleave 展开成每行。
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
+        # CP 布局（可选）。cp active 有两种判据：
+        #   legacy_cp=True  → HCU：本函数在 CP 切分之后被显式调用
+        #   is_cp_active()  → 策略 CP：runner 已经切过
+        # 返回 None 表示走非 CP 分支（整批行号语义）。
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
             if legacy_cp or is_cp_active(forward_batch)
             else None
         )
 
+        # 【Q2 ②】关键一步：把尾段当成一个独立的 prefill 批，递归构造完整元数据。
+        #   传进去的都是尾段视角的量：
+        #     out_cache_loc     尾行的写入位置（不是整批）
+        #     num_tokens        sum(tail_lens)
+        #     extend_seq_lens   tail_lens（每请求尾长，不是原 extend 长）
+        #     extend_start_loc  cumsum(tail_lens)-tail_lens（尾段自己的前缀和）
+        #     swa_replay_start  每行窗口下界，让 SWA 窗口不从历史更早处开始
+        #   于是尾段自然获得自己的 page_table / SWA 窗口 / indexer 元数据 ——
+        #   这就是晚层能用一个小批跑完的原因。
         metadata = self.init_forward_metadata_prefill(
             max_seq_len=int(seq_lens_cpu.max().item()),
             req_pool_indices=forward_batch.req_pool_indices,
@@ -2350,6 +2428,8 @@ class DeepseekV4AttnBackend(
             forward_batch=forward_batch if cp_tail is not None else None,
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
+        # SWA 池与 full 池的地址空间不同：full 池的 slot 要翻译成 SWA 池落点。
+        # 例外是 encoder replay 的 request_window 模式 —— 那里直接给 write_loc。
         swa_out_cache_loc = (
             metadata.core_attn_metadata.request_window_layout.write_loc
             if self.token_to_kv_pool.request_window is not None
@@ -2358,6 +2438,8 @@ class DeepseekV4AttnBackend(
             )
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
+        # 把每请求的 req_pool_indices 展开成每行（长度 = Σ尾长）。
+        # 压缩器与 indexer 都按行访问请求级状态，所以要这份行级展开。
         metadata.low_ratio_req_indices = torch.repeat_interleave(
             forward_batch.req_pool_indices.to(torch.int64), tail_lens.to(torch.int64)
         )
@@ -2367,6 +2449,11 @@ class DeepseekV4AttnBackend(
             contiguous_start=contiguous_start,
         )
         metadata.low_ratio_pos_i64 = positions.to(torch.int64)
+        # 两种尾段形态：
+        #   非 CP：token_indices 直接索引本 rank 的整批 extend（行号即 extend 行号）
+        #   CP  ：token_indices 换成【本 rank 的局部行号】，并带 pad_rows / cp_metadata，
+        #         同时保留 global_token_indices / req_global / pos_global
+        #         （DSpark 注入与压缩器需要全局行号，不能用局部行号）
         if cp_tail is None:
             # Without CP, tail rows index the full extend on this rank.
             metadata.late_layer_tail = LateLayerTail(

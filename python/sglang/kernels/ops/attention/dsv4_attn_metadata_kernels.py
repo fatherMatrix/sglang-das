@@ -295,6 +295,27 @@ def build_page_table_positions(
     page_size: int,
     swa_window: int,
 ) -> PageTablePositionsResult:
+    """由"请求+位置 → slot"表推出每个 query 行要读的【页号列表】。
+
+    ★ 先纠正一个常见误解：**page_table 的一行不是"这个 token 在哪一页"**，
+      而是"这个 token 要读的所有页"（也就是整段前缀的页号列表）。
+
+        req_to_token[req, j]        = 请求 req 的第 j 个 token 在池里的 slot
+        req_to_token[req, ::ps]     = 每页取一个代表（页内 slot 连续，取一个够）
+        ... // page_size            = slot → 页号
+
+      于是 page_table[i] = 该行所属请求的【序列页号表】：
+        · 列数 = max_seq_len // page_size（最坏情况下序列能占多少页）
+        · 内容与 i 无关，只与 req_pool_indices_repeated[i] 有关
+          → 同一请求的所有 token 行完全相同（重复存储，最多 bs 种不同行）。
+            做成 N 行是为了让 kernel 用 `row = program_id` 直接按行取。
+        · 真正用到前几列，由同一行的 seq_lens_casual[i] 决定
+          （读 ceil(L / page_size) 列），位置则由 positions_casual[i] = L-1 给出。
+
+      "一个 token 只在一个 slot / 一页里"是对的，但那是【写】和【自身位置】的事；
+      这里要的是【读】：一个 query 要读它之前的全部 token，自然是一串页。
+    """
+
     seq_lens_casual = seq_lens_casual.to(torch.int32)
     positions_casual = seq_lens_casual - 1
     page_table = req_to_token[

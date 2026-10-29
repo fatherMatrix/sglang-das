@@ -1380,7 +1380,9 @@ class DSV4Metadata:
     #   AttnBackend
     #    ├─ forward_metadata : DSV4Metadata            ← 整批（runner 里 ① 建）
     #    │    ├─ core_attn_metadata : DSV4AttnMetadata   1 个对象（无 per-token 实例）
-    #    │    │     page_table             (N, 页数)  每行 = 一个 token
+    #    │    │     page_table             (N, 页数)  每行 = 该 token "要读的全部页"
+    #    │    │                                         （= 所属请求的序列页号表，
+    #    │    │                                          同请求的 token 行内容相同）
     #    │    │     seq_lens_casual        (N,)       每元素 = 一个 token
     #    │    │     positions_casual       (N,)
     #    │    │     swa_page_indices       (N, 64)    每行 = 一个 token

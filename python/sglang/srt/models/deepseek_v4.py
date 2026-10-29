@@ -5278,6 +5278,15 @@ class DeepseekV4Model(nn.Module):
                     )
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
                 input_ids = cp_round_robin_input_ids(input_ids)
+            # 切完行之后 ids 必须跟着换——它们和 hidden 是【成对】消费的。
+            #   块 2 建 input_ids_global 时 input_ids 还是【切分前】的整批；
+            #   这里它已被 cp_round_robin_input_ids 重绑成
+            #   （有 a2a：rank-local 子集 / 无 a2a：全量 rank-major 重排），
+            #   不跟着换就等于"旧行序的 id 配新行序的 hidden"，
+            #   hash 路由按行查 id 时整体错位。
+            #   无 a2a 时这一步尤其重要：重排后的顺序恰好等于
+            #   attn_cp_interleave_gather 拼回全量后的行序，
+            #   所以这里拿到的正是 MoE 需要的"全局 id"。
             input_ids_global = input_ids
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.

@@ -219,7 +219,29 @@ def compute_engram_hash_ids(
 ) -> torch.Tensor:
     """tokens [T, n]: column 0 is the token itself, column s its s-th predecessor;
     blocked [T, n] marks look-back that ran off the sequence start. Returns
-    [T, n_engram_layers, (n - 1) * n_heads] row ids into each layer's table."""
+    [T, n_engram_layers, (n - 1) * n_heads] row ids into each layer's table.
+
+    ★ 列数怎么来的（V4.1：n = max_ngram_size = 4，n_heads = 8）
+        (n - 1) = 3 种【n-gram 阶数】= {2-gram, 3-gram, 4-gram}
+        n_heads = 8  每种阶数用 8 个不同素数取模 → 8 个"头"
+        ⇒ 每 token 24 个行号 = 3 × 8
+        ★ "3 阶"是"3 种阶数"的意思（不是"3-gram"）：
+          n 从 2 数到 max_ngram_size，所以是 n-1 种。
+
+    列的顺序（cat 出来的顺序）：
+        [2-gram 的 8 个头][3-gram 的 8 个头][4-gram 的 8 个头]
+    每一列都是"以当前 token 结尾的某个后缀 n-gram，在某个头下的行号"：
+        h(t, n, k) = ( x'_t·μ0 ⊕ x'_{t-1}·μ1 ⊕ … ⊕ x'_{t-n+1}·μ_{n-1} )
+                     mod p_{n,k}  +  o_{n,k}
+    其中 p_{n,k} 是互不相同的素数，o_{n,k} 是该子表在"拼接大表"里的起始偏移
+    （24 张 ~16M 行的子表首尾相接，合计 ~384M 行 × 256 维）。
+
+    为什么要多阶 + 多头：
+      · 多阶：2-gram 记"相邻搭配"，3/4-gram 记"更长短语"（后缀越长，模式在
+        最后一个 token 处才完整）；
+      · 多头：不同素数 ⇒ 不同碰撞模式。两个不同 n-gram 可能在某一头撞到同一行，
+        但同时撞上 8 个头的概率极低 —— 相当于用 8 个哈希做集成。
+    """
     compressed = torch.where(blocked, pad_id, token_map[tokens])
     products = compressed.unsqueeze(1) * multipliers
     # After step i the running xor is the (i + 1)-gram hash, bucketed by that

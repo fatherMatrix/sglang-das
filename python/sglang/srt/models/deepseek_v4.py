@@ -4785,6 +4785,24 @@ class DeepseekV4Model(nn.Module):
             with ctx:
                 # 【块 11】HIP 专用快路径：一层内的 mHC 边界被融进单个 kernel。
                 #   与块 12 语义等价，只是省掉多次 kernel 启动。
+                #
+                # ★ HCU 会不会进这里？—— 不会，恒走块 12。两个条件逐个看：
+                #   ① _is_hip            ：HCU 上是 True（is_hcu() 第一句就要求 is_hip()；
+                #                           HCU 是 HIP 后端，gcn arch 为 gfx936/938/928）
+                #   ② hc_boundary_fused  ：在 DecoderLayer.__init__ 里由
+                #                           _hip.init_decoder_layer 设定为
+                #                             _is_gfx95_supported
+                #                             and hc_pre_from_prev_sublayer
+                #                             and hc_mult == 4
+                #                           而 is_gfx95_supported() 要求 gcnArchName 里
+                #                           含 "gfx95" —— HCU 的 arch 是 gfx936/938/928，
+                #                           所以这里恒为 False。
+                #   ⇒ True and False → 跳过，走下面的 forward_hc_pre_from_prev。
+                #
+                #   块 11 到底省了什么：把本层 FFN 的 hc_post 推迟（HcPending），
+                #   留到下一层的边界 kernel 里和它的 hc_pre 一起算 —— 一次启动代替
+                #   两次；数值结果与块 12 完全一致（见 forward_layer_fused_boundary
+                #   的 docstring，以及 defer_post 在 Engram / DSpark 捕获层上的例外）。
                 if _is_hip and self.layers[i].hc_boundary_fused:
                     state = _hip.forward_layer_fused_boundary(
                         self,

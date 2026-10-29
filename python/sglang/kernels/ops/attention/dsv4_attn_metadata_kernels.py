@@ -314,6 +314,13 @@ def build_page_table_positions(
 
       "一个 token 只在一个 slot / 一页里"是对的，但那是【写】和【自身位置】的事；
       这里要的是【读】：一个 query 要读它之前的全部 token，自然是一串页。
+
+    ★ 谁真的在读它（V4.1 prefill）：
+        · indexer 打分：拿到的是"第几个压缩块"这种逻辑下标，必须靠 page_table
+          换算成物理页/slot（见 dsv4/indexer.py: topk_transform_paged）
+        · init_forward_metadata_indexer：把它 expand 成 64-slot 粒度的索引页表
+      主稀疏注意力 kernel 不直接读它 —— 它读的是 indexer 产出的
+      c1/c2_sparse_page_indices（已经是物理 slot 了）。
     """
 
     seq_lens_casual = seq_lens_casual.to(torch.int32)

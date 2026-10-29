@@ -5747,8 +5747,42 @@ class DeepseekV4ForCausalLM(nn.Module):
                     )
 
         # 【块 C】进入模型主干（DeepseekV4Model.forward）。
-        #   maybe_input_scattered 描述"输入是否已按 TP/CP 打散"，
-        #   决定主干里是否还要做切分与 gather（见主干的块 2 与块 6）。
+        #
+        # ★ 这里用 `with` 不是为了"包一段代码好看"，而是为了【成对地改一个
+        #   forward 级全局标志】+ 【退出时清缓存】。三件事：
+        #
+        #   ① with 在 Python 里的语义 = 上下文管理器协议：
+        #        进入块前调 __enter__，离开块时【无论正常还是抛异常】都调
+        #        __exit__。所以它适合做"进入时设状态、退出时一定还原"。
+        #      这里的上下文管理器是 @contextmanager 的生成器写法：
+        #        函数执行到 yield 之前 = __enter__；yield 之后 = __exit__。
+        #
+        #   ② 它设的标志是 forward.attn_input_scattered，取值来自
+        #        AttnTpContext.use_input_scattered(forward_batch)
+        #        = allow_input_scattered            （能力开关，见 init_context）
+        #          and forward_mode.is_extend()     （只有 prefill 有这优化）
+        #          and not is_target_verify()
+        #          and input_ids is not None
+        #          and not forward_batch.can_run_tbo （TBO 有自己的分区，冲突）
+        #      语义：True = 本 rank 的 hidden 只含"自己那份 token"（TP 组内已打散），
+        #            主干里不要再 scatter；False = 输入是完整的，按常规处理。
+        #      内部实现用的是 forward.scoped(...)：保存旧值 → 设新值 → finally 还原
+        #      （曾经的写法是直接赋值，抛异常就不还原 → 标志泄漏到下一个批，
+        #        注释里留了这句："the old in-place swap leaked the flag on exceptions"）。
+        #
+        #   ③ 退出时还会 finally 清掉 forward.set("attn_inputs", None)：
+        #      那是模型里暂存的"本次 attention 输入"，跨 forward 复用会读到上一批
+        #      的张量，所以每批结束必须作废。
+        #
+        # ★ 谁在读这个标志：
+        #     layer_boundary 的 fetch_qkv_latent / fetch_hidden_states
+        #       → 决定要不要再调一次 tp_gather（已经打散了才需要 gather 回来）
+        #     moe/topk.py
+        #       → 影响 MoE 的 token 计数与路由（打散形态下每 rank token 数不同）
+        #
+        # ★ 在 HCU 上的实际情况：allow_input_scattered 的判据里含
+        #   `(_is_cuda or _is_npu)`，HCU 两者皆 False → 恒为 False。
+        #   所以这个 with 在 HCU 上标志恒为 False，实际作用退化为"清 attn_inputs"。
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors

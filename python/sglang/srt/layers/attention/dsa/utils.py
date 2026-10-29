@@ -284,6 +284,29 @@ def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
 
 
 def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
+    """按行做 round-robin：第 i 行归 rank (i % cp_size)。返回本 rank 的那部分。
+
+    例（cp_size=4，8 行）：
+        rank0 → 行 0,4      rank1 → 行 1,5      rank2 → 行 2,6      rank3 → 行 3,7
+
+    ★ 两条路径的差别只在"怎么取"，结果完全一致：
+      · 行数能被 cp_size 整除（常态）
+            input_.view(-1, cp_size, *rest)[:, cp_rank]
+        这是把一个 (G, cp, ...) 张量取第 cp_rank 列 —— **视图**，零拷贝；
+        但它是跨步的（stride(0) 变成原来的 cp_size 倍），
+        下面那个 stride 检查就是为此：kernel 要连续内存时才 clone。
+      · 除不尽（小批 / 尾部残行）
+            input_[arange(cp_rank, n, cp)]
+        退化成 gather，因为 view 需要整除。行数不足时返回空张量
+        （cur_len == 0 的分支），而不是报错。
+
+    ★ 对 list 输入走 `input_[range(rank, n, cp)]`，即按元素挑（元素可以是张量）。
+
+    ★ 为什么必须是这条规则（而不是连续切段）：
+      CP 只切"计算"，不切 KV。压缩器写 KV 前会把行 all-gather 回全局序，
+      所以每行的归属必须在 all-gather 后能按同一个公式还原 ——
+      i % cp_size 满足这一点（见 tail 的 gather_index 里 owner = v % cp_size）。
+    """
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
     if isinstance(input_, (tuple, list)):

@@ -5227,6 +5227,45 @@ class DeepseekV4Model(nn.Module):
         #
         #   注意：切 token ≠ 切 KV。非 LayerSplit 时每个 rank 仍持有整段序列
         #   的 KV 副本；省 KV 显存的是 LayerSplit，不是 CP。
+        #
+        # ── 这里到底切了什么（三个调用逐个看）────────────────────────────
+        #   ① hidden_states = cp_split_and_rebuild_data(fb, hidden)
+        #        按 token 行做 round-robin：第 i 行 → rank (i % cp_size)。
+        #        内部 dsa_cp_round_robin_split_data 有两套实现：
+        #          · 行数能被 cp_size 整除 → view(-1, cp, ...)[:, rank]
+        #            这是一个【视图】（stride 非连续，必要时再 clone）
+        #          · 除不尽               → arange(rank, n, cp) 做 gather
+        #        只在 is_first_rank 时做（PP 场景下 hidden 由前一段 stage 负责）
+        #
+        #   ② positions = cp_split_and_rebuild_position(fb, positions)
+        #        同一套规则，作用在 positions 上。★ 必须与 ① 用同一条规则，
+        #        否则 RoPE 相位与 hidden 的行对不上（症状：结果全错但不报错）
+        #
+        #   ③ input_ids = cp_round_robin_input_ids(input_ids)
+        #        ★ 这条规则和 ①② 不同，取决于 MoE 是否走 A2A：
+        #          · 有 A2A（deepep）  → input_ids[rank::cp]   与 ① 同规则，
+        #                                长度 N/cp（rank-local）
+        #          · 无 A2A（TP-MoE）  → reshape(-1,cp).T.flatten()
+        #                                长度仍是 N，但行序变成 rank-major
+        #                                [0,8,16,…,1,9,17,…]
+        #        为什么无 A2A 时要保留全量：因为 MoE 阶段 hidden 会被
+        #        attn_cp_interleave_gather 拼回全量（rank 序拼接），
+        #        input_ids 必须提前排成那个顺序，路由才对得上。
+        #        这也解释了为什么"CP + bounded replay"要求 A2A：尾段按
+        #        t % cp_size 选行，前提是"本 rank 只有自己那 1/cp 行"。
+        #
+        # ── 那"切 KV 存储"发生在哪 ────────────────────────────────────
+        #   在 LayerSplit（cp_cache_layer_split 包），而且切的是【层】不是 token：
+        #     · 每个 CP rank 只持久化连续一段层的 KV（约 1/8 显存）
+        #     · 写：压缩器先把全序列 all-gather 回全局序
+        #       （cp_materialize_global_token_order），所以本 rank 手里有
+        #       完整行，能给自己 owned 的层写【全量行】；
+        #       非 owned 层的 set_* 直接早退（set_swa_key_buffer 里
+        #       `if not self._owns_swa_layer_id(layer_id): return`）
+        #     · 读：非 owned 层由 owner 把并集页 compact 成 staging 再广播
+        #     · 不开 LS：每个 rank 写一份全量副本（8 卡 = 8 份）
+        #   ⇒ CP（token 维，省算力）与 LS（层维，省显存）是两个正交维度，
+        #     本函数只碰前者，一行都不动 KV 池。
         # ------------------------------------------------------------------
         if use_prefill_cp and not run_tbo:
             if cp_v2_active:

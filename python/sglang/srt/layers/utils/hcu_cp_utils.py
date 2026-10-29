@@ -127,6 +127,22 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
+    """把整批行切成本 rank 的行（hidden_states / 其它行对齐张量通用）。
+
+    两种切法由 cp strategy 决定，结果形状都是 N/cp_size：
+
+      ① round-robin（interleave，HCU 走这条）
+           第 i 行 → rank (i % cp_size)，即隔 cp 取 1
+           实际调用 dsa_cp_round_robin_split_data，实现是
+           view(-1, cp, ...)[:, rank]（视图）或 arange(rank, n, cp)（gather）
+      ② zigzag（in-seq-split，NPU/其它平台）
+           先按 split_list 把序列切成 2*cp 段，再按 zigzag_index 取本 rank 的两段
+           这就是下面 torch.split + cat 那段；因为每段长度可能不同，
+           必须走真实切分，不能用 view
+
+    ★ 只切"计算行"，不碰 KV 存储。压缩器写 KV 前会把行 all-gather 回全局序，
+      所以这里切走 7/8 不会导致 KV 缺失（见 deepseek_v4.py 的 ② 注释）。
+    """
     from sglang.srt.layers.attention.dsa.utils import (
         dsa_cp_round_robin_split_data,
         is_dsa_prefill_cp_round_robin_split,
@@ -186,6 +202,21 @@ def cp_round_robin_input_ids(input_ids):
     rank1: 1,9,17,...
     rank2: 2,10,18,...
     ...
+
+    ★ 两条分支的【长度不同】，这是最容易看漏的一点：
+        有 A2A    → input_ids[rank::cp]             长度 N/cp（rank-local 子集）
+        无 A2A    → reshape(-1,cp).T.flatten()      长度仍是 N（全量，只是重排）
+
+    ★ 为什么无 A2A 时要保留全量、且排成 rank-major：
+      这时 MoE 是"TP-MoE 无 A2A"，hidden 在进 MoE 之前会被
+      attn_cp_interleave_gather 拼回全量（按 rank 序把各 rank 的 1/cp 段
+      首尾相接，等价于 all-gather），拼出来的行序正好是
+          [rank0 的全部行][rank1 的全部行]...  = [0,8,16,…, 1,9,17,…]
+      所以 input_ids 必须先排成同一顺序，"第 i 行 ↔ 第 i 个 id"才对得上。
+
+    ★ 与 hidden 的切法严格配套：
+      cp_split_and_rebuild_data 按 i % cp_size 取行，本函数按同一划分
+      取子集/重排，两者作用在同一批行上，顺序必须一致。
     """
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank

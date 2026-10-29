@@ -1079,6 +1079,10 @@ def engram_gate(
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
+    # γq · γk：q_weight / k_weight 是两个 RMSNorm 的 γ（逐维缩放），
+    # 归一化后的点积里可以把两者合并成一次乘法，省一份中间量。
+    # 代码里它们初始化为 ones（requires_grad=False）；若 checkpoint 带对应
+    # key 会被通用加载器覆盖，否则等价于 γ=1（不做逐维缩放）。
     weight = q_weight.float() * k_weight.float()
     h = x.float()
     # Normalized per (token, hc copy) over dim, not jointly over the copies.
@@ -1109,6 +1113,21 @@ class Engram(nn.Module):
             layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+        # ★ wkv = 把"查表得到的记忆"投影成【hc_mult 个 key + 1 个共享 value】。
+        #   这不是 attention 的 K/V 投影，只是门控要用的中间量。
+        #
+        #   实际数字（V4.1）：n_hash_cols = (4-1)*8 = 24，head_dim = 256
+        #      输入 = 24 * 256            = 6144   ← 一个 token 查 24 行、每行 256 维
+        #      输出 = 5120 * (4 + 1)      = 25600  ← 4 条残差流各一个 key + 1 个共享 value
+        #   即论文 §2.4 的"多分支集成"：一张 [25600, 6144] 的矩阵，
+        #   5 个投影拼在一起，一次 GEMM 同时算完（FP8 稠密）。
+        #
+        #   为什么用 ReplicatedLinear 而不是列/行并行：
+        #     输入 emb 在每个 TP rank 上【完全相同】（shared 布局查表人人一样；
+        #     per_rank 布局经 all_reduce 之后也人人一样），所以每个 rank 都能
+        #     独立算出完整的 kv，不需要 all_gather / all_reduce。
+        #     ReplicatedLinear 就是"权重不切分、forward 里只有一次 GEMM"，
+        #     代价是权重在每 rank 各存一份（25600*6144 ≈ 157M，FP8 约 157 MB）。
         self.wkv = ReplicatedLinear(
             n_hash_cols * layout.head_dim,
             dim * (hc_mult + 1),

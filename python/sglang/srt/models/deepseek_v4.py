@@ -1359,6 +1359,25 @@ class MQALayer(MqaAttentionBase):
                 )
         elif self.compress_ratio in (1, 2):
             # The layers in between read both through the attention backend.
+            #
+            # ★ 这里是"为什么后面的层会用到前面层的 indexer"的答案：
+            #   本模型不是"每层各算一份压缩状态和一份 top-k"，而是【按家族共享】。
+            #   只有两类层有对应模块，其余层两者都不建：
+            #     · layer_id ∈ kv_source_layer_ids     → 建 compressor（写 C1/C2）
+            #     · layer_id ∈ index_source_layer_ids  → 建 indexer（算 top-k 选块）
+            #   "in between" 的层（既不是 kv 源也不是 index 源）什么都不建，
+            #   它们的注意力直接读 backend 元数据里【已经算好】的那份。
+            #
+            # ★ 共享靠"按 ratio 分配 buffer"实现，不是按层：
+            #     DSV4AttnMetadata 里是 c1_sparse_* / c2_sparse_*（每个压缩比一份）
+            #     访问器签名 sparse_page_indices(self, compress_ratio) 里【没有
+            #     layer_id】—— 这本身就说明同一 ratio 的所有层看的是同一份。
+            #   推论：同一 ratio 下若真有多个 index_source 层，后跑的会覆盖前面的，
+            #   所以架构上每个 ratio 实际上只有一份有效选择。
+            #
+            # ★ 晚层（ratio 0，既不是 kv 源也不是 index 源）同样读这份 buffer，
+            #   这就是 enter_late_layer_tail 必须把 sparse 三件套按尾行拷过去的原因
+            #   （见 deepseek_v4_backend.py 的六步说明）。
             if self.layer_id in config.kv_source_layer_ids:
                 self.compressor = DeepseekV41Compressor(
                     hidden_size=config.hidden_size,

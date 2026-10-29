@@ -914,6 +914,26 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
+        """四个出口，**按顺序命中第一个**。看清楚"表在哪、要不要跨 rank 合并"：
+
+          ① if self._shared                 ← 本部署（HCU）走这一支
+               host 表 + layout="shared"：每个 rank 都映射同一整块 host 内存，
+               一次 engram_gather 就够 —— 无需 all_gather 索引、无需 all_reduce。
+          ② if cp_all_tokens and tp_size>1  ← 非 shared + CP
+               每 rank 只有 1/tp 的行，所以先在 CP 组 all_gather【索引】，
+               让所有 rank 用同一批索引查表，再取本 rank 的切片。
+          ③ if tp_size>1 and attn_dp>1       ← 非 shared + attention-DP
+               先把各 DP rank 的索引拼成全局（见 _dp_sharded_lookup）。
+          ④ return self._lookup(indices)     ← 非 shared 的常规路径
+               每 rank 只查自己那段行（未拥有填 0）→ all_reduce 合并。
+               恰好一份非零，所以"求和"等价于"选中"。
+
+        HCU 为何落在 ①：environ.py 里
+            SGLANG_HCU_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(True)   ← 默认开
+            SGLANG_HCU_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")← 默认整表
+        非 HCU 恰好相反：
+            SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)      ← 默认关（表在显存）
+        """
         if self._shared:
             if indices.shape[0] == 0:
                 return self._empty(indices)

@@ -19,6 +19,26 @@ def _engram_gate_kernel(
     CLAMP: tl.constexpr,
     B: tl.constexpr,
 ):
+    """一行 = 一个 (token, hc 通道) 对；公式（全是 fp32）：
+
+        x   = X[t, c, :]                  ← 残差 state.residual 的第 c 个通道
+        key = KV[t, c, :]                 ← 该通道专属的 key
+        val = KV[t, HC, :]                ← 【所有通道共享】的 value
+        w   = q_weight[c] * k_weight[c]   ← 逐维门控权重（可学的静态参数）
+
+        rstd = 1/sqrt(mean(x^2)+eps) * 1/sqrt(mean(key^2)+eps)
+        dot  = Σ(x*w*key) * rstd / sqrt(D)      ← 双向归一化内积 ≈ 余弦相似度
+        gate = sigmoid(copysign(sqrt(max(|dot|, CLAMP)), dot))   ∈ (0,1)
+
+        out[t, c, :] = x + gate * val
+
+    ⇒ **用相似度当门的加性记忆**：
+         · 记忆与当前残差"像" → dot 大 → gate→1 → 把 val 加进去；
+         · 不像 → gate→0 → 几乎不加（残差原样通过）。
+       val 是所有通道共用的一份，但每个通道的 key 与 q/k 权重不同，
+       gate 也就不同 —— 所以同一个记忆在不同通道上被"有选择地"吸收。
+       copysign(sqrt(|dot|)) 把符号带回来，gate<0.5 表示负相关（抑制）。
+    """
     row = tl.program_id(0)
     token = row // HC
     hc = row % HC

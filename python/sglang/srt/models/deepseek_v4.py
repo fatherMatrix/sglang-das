@@ -1372,8 +1372,20 @@ class MQALayer(MqaAttentionBase):
             #     DSV4AttnMetadata 里是 c1_sparse_* / c2_sparse_*（每个压缩比一份）
             #     访问器签名 sparse_page_indices(self, compress_ratio) 里【没有
             #     layer_id】—— 这本身就说明同一 ratio 的所有层看的是同一份。
-            #   推论：同一 ratio 下若真有多个 index_source 层，后跑的会覆盖前面的，
-            #   所以架构上每个 ratio 实际上只有一份有效选择。
+            #
+            # ★ 官方 config（DeepSeek-V4.1-Flash）里这两个列表是：
+            #     kv_source_layer_ids    = [2, 8, 14, 20]          （4 层）
+            #     index_source_layer_ids = [2, 8, 14, 20, 24, 28, 32, 36]（8 层）
+            #     compress_ratios        = [0,0, 2×18(层2..19), 1×20(层20..39), 0×3(MTP)]
+            #     candidate_source_layer_id = 20, candidate_topk_blocks=2048,
+            #     candidate_block_size=8, index_topk=512, sliding_window=128
+            #   按架构（CSA2）四类层，正好与本处的 if 对应：
+            #     window  层 0,1            ratio 0，两者都不建（只做滑窗）
+            #     Full    层 2,8,14,20      既是 kv_source 又是 index_source → 两者都建
+            #     Reindex 层 24,28,32,36    只在 index_source → 只建 indexer（自带打分）
+            #     Reuse   其余 30 层        两者都不建 → 读最近一次刷新的结果
+            #   所以"同 ratio 有多个 index 源"并非冲突：每个 index 源会刷新它之后
+            #   那一段 Reuse 层的选择（就近向上绑定最近的源，见池的 source_layer_of）。
             #
             # ★ 晚层（ratio 0，既不是 kv 源也不是 index 源）同样读这份 buffer，
             #   这就是 enter_late_layer_tail 必须把 sparse 三件套按尾行拷过去的原因

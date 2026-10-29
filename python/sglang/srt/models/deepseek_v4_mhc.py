@@ -17,6 +17,59 @@ where an Engram or a row selection can replace ``R`` (`with_residual`/`take_rows
 The layer owns parameters, parallelism and token-range policy; this module owns
 the kernel dispatch.
 
+======================================================================
+四步各自的融合清单（V4.1 到底有哪些融合，按生效范围排）
+======================================================================
+  ① mix stats（步骤 1）—— H·R + RMS + Sinkhorn(20 轮) + 门控 → (pre, post, comb)
+       通用  : mhc_pre（kernels/ops/layernorm/mhc.py:1243）
+       TileLang 变体 : mhc_pre_big_fuse_tilelang / mhc_pre_big_fuse_with_norm_tilelang
+                       （连下一层 norm 一起做）
+       HCU   : rmsnorm_with_sinkhorn / hc_mix_reduce_sinkhorn_vec
+               （mhc_boundary_hip.py；条件 _use_hcu_hc_mix_stats =
+                 is_hcu and SGLANG_USE_LIGHTOP and SGLANG_HCU_HC_MIX_STATS_OPT，
+                 且权重已 split 成 tf32/bf16 两半，shape (24, 20480)）
+       ★ 另有 stats_stream：把步骤 1 放独立流与 2~3 重叠（use_stats_stream；
+         decode-like 且非 sm90 时启用 —— HCU 命中）
+
+  ② combine（步骤 2）—— Σ_m pre[m]·R[m] + RMSNorm（+ 可选量化/打散）
+       hc_combine（elementwise/hc_combine.py）/ hc_combine_norm
+       （layernorm/hc_combine_norm.py）
+       ★ 若上一个 post 已返回 HcNormed/HcQuantized，combine 直接短路，什么都不算
+
+  ③ post（步骤 4）—— R'[i] = post[i]·y + Σ_j comb[j][i]·R[j]
+       mhc_post / mhc_post_tilelang（mhc.py）
+       mhc_post_split_h（gfx95，HC==4，小批按 hidden 切 CTA）
+
+  ④ post + 下一层 combine + norm
+       mhc_post_combine_norm_prefill（layernorm/...py）
+       条件：can_fuse_post → blackwell + pre_from_prev + mult==4 + hidden==5120
+             + attn_dp_size==1（另加行数 4096..65536）
+
+  ⑤ post + combine + norm + TP all-reduce（注意力侧）
+       all_reduce_mhc_post_combine_norm（communication/all_reduce_mhc.py）
+       条件：_can_fuse_attn_mhc → tp_size == attn_tp_size == 4 + can_fuse_post
+
+  ⑥ MoE finalize + all-reduce + post + combine + norm（+ 量化）
+       moe_finalize_all_reduce_mhc_post_combine_norm[_quant]
+       条件：_can_fuse_ffn_mhc → mlp.tp_size == 4 + 无 A2A + can_fuse_post
+             （quant 版还要求 expert_weights.shape[0] <= 128）
+
+  ⑦ 跨层 deferred post（把本层 post 推迟进下一层边界 kernel）
+       hc_boundary_fused_deferred（mhc_boundary_hip.py；gfx95）
+       条件：_is_gfx95_supported + hc_pre_from_prev + hc_mult == 4
+             （见 deepseek_v4.py 块 11；defer_post 遇到 Engram/捕获层会放弃）
+
+  ⑧ 出口 hc_head —— RMSNorm + F.linear(hc_fn) + 混合 + 最终 norm
+       mhc_head.py（layernorm/mhc_head.py）
+
+  ⑨ 入口 hc_broadcast（[T,H] → [T,hc_mult,H]）；
+     HCU 的 CP 推迟路径可与切片融合（lightop mhc_repeat_cp_sglang）
+
+  ⑩ 跨层"post + 下一层 pre"（V4 Pro 的 mhc_fused_post_pre）
+       ★ 对 V4.1【结构性不可表达】：本模块 docstring 第 12-13 行说的 lag 就是它
+         （pre 由上一个 post 产出，边界处已无 pre 可算）。所以
+         use_fused_mhc_post_pre 被置 False，这不是平台缺失，是语义冲突。
+
 TODO: move dsv4 MHC into the same abstraction
 """
 

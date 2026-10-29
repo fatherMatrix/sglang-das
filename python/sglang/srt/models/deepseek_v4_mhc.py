@@ -372,7 +372,52 @@ class HcState(msgspec.Struct):
 
 class HcNextBoundary(NamedTuple):
     """What the next hyper-connection can take off this one's post; resolved after
-    weights load. None where the seam is closed (last layer, Engram)."""
+    weights load. None where the seam is closed (last layer, Engram).
+
+    ==================================================================
+    "boundary"（接缝）到底是什么
+    ==================================================================
+    它不是一条线，而是**两个子层之间的交接点**：上一个子层的 post
+    产出 R'，下一个子层需要 norm(Σ pre·R')。这个交接点上有三件事可以
+    被上游顺带做掉，能不能做取决于下面三个字段。
+
+    一次 forward 里每层有两种 boundary（都在 _init_boundaries 里建）：
+        local_boundary : ATTN[i] → FFN[i]       norm = post_attention_layernorm
+        next_boundary  : FFN[i]  → ATTN[i+1]    norm = 下一层的 input_layernorm
+    命名里的 next 是"下一个子层"，不是"下一层"——后者是 next_boundary 的特例。
+
+    三个字段各自的用途：
+        norm          上游 kernel 要把 norm 折进去，需要它的
+                      weight 与 variance_epsilon（RMSNorm 的两个输入）。
+        norm_fusable  这个 norm 折不折得动（见 make_boundary 的五项检查）。
+                      False 时上游只做纯 post，下游自己算 combine+norm。
+        accepts_mxfp8 下游是否接受 HcQuantized（normed + swizzled）。
+                      True 时上游连"量化+打散"一起做，省一次量化 kernel；
+                      False 时只返回到 HcNormed 为止。
+
+    三个消费者（传进去的 next 就是这里的对象）：
+        _post_fusion                → mhc_post_combine_norm_prefill
+        run_attn_post(AttnOutput)   → all_reduce_mhc_post_combine_norm
+        run_moe_post(deferred)      → moe_finalize_all_reduce_mhc_post_combine_norm[_quant]
+                                      （_quant 版由 accepts_mxfp8 决定）
+
+    seam 关闭的四级（严重程度递增）：
+        ① 下一层挂 Engram / 末层 → bind_next 不绑 → next_boundary is None
+        ② 尾段要把行收窄     → run_ffn_hc 里 seam_open=False → 传 None
+        ③ norm 不可融合       → norm_fusable=False（seam 在，只是退化成纯 post）
+        ④ 下游不吃打散输入     → accepts_mxfp8=False（只到 HcNormed）
+
+    生命周期：
+        bind_next(layers[i+1])          模型 build 完成后调用一次（记 _next_layer）
+        _init_boundaries()              首次 forward（accepts_mxfp8 要等权重转换）
+        refresh_mhc_norm_weight_cache() 权重变更后清空两者，下次 forward 重建
+
+    ★ 与 HcPending（gfx95）的区别：
+        本类 + HcNormed 是**数据流融合**：post 顺手把 combine+norm 算出来。
+        HcPending 是**控制流融合**：把 post 整个推迟，让下一个边界 kernel
+        一次做"上个 post + 本次 combine + 本次 mixing stats"，再把
+        reduce/sinkhorn 挂在紧随的 RMSNorm launch 上（HcCoefficients）。
+    """
 
     norm: RMSNorm
     accepts_mxfp8: bool

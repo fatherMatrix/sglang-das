@@ -5112,6 +5112,12 @@ class DeepseekV4Model(nn.Module):
         # 四个连带影响（都能在别处对上），逐条说清"为什么"：
         #
         #  ① 禁用 TBO：run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        #     ★ 这一条是【upstream 原有】，不是 HCU 改的：
+        #         · v0.5.18（/data1/code/github/sglang，无注释的干净上游）已有同一行
+        #           而那个版本里连 _forward_layers_hc_pre_from_prev 都还不存在，
+        #           说明"有捕获就不跑 TBO"早于 V4.1 层路径出现；
+        #         · v0.5.18 / v0.5.22 的 _forward_layers_tbo 里 capture_dspark
+        #           出现次数都是 0（TBO 路径从未实现捕获）。
         #     ★ 这是【实现层面】的互斥，不是语义上不可能：
         #       TBO 走的是另一条路径 _forward_layers_tbo（operations_strategy 的
         #       op 图），那里【完全没有捕获代码】—— 它不做 eager 的逐层循环，

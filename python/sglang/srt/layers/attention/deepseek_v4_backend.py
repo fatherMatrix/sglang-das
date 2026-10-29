@@ -3337,11 +3337,22 @@ class DeepseekV4AttnBackend(
                 # 任一端为 None 就跳过：某家族可能只有其中几种（例如 decode 没有 raw）
                 if full_buf is None or tail_buf is None:
                     continue
-                # real_rows：按【尾段行号】从整批 buffer 里取行
-                #   （CP 下会自动用 global/局部行号换算，见 LateLayerTail.real_rows）
+                # real_rows 就是一次【按行 gather】：
+                #     tail.real_rows(full_buf) == full_buf[tail.token_indices]
+                #   （单请求且尾行连续时走切片快路径，见 _tail_rows：
+                #     full_buf[start : start+t]，零拷贝）
+                #   注意拷的是【索引表】，不是 KV 数据本身：
+                #     源 = 整批元数据里早层算好的 top-k 结果（N 行）
+                #     目标 = 尾段元数据里的同类表（t 行）
+                #   值（物理 slot / 逻辑下标）在两个对象里通用，因为它们指向
+                #   同一个 KV 池 —— 所以只需要换行，不需要重新映射值。
                 rows = tail.real_rows(full_buf)
-                # 拷到尾部 buffer 的前 rows 行；后面的位置【保持初始 -1】
+                # 等价于：tail_buf[:t] = full_buf[token_indices]
+                #   只写前 t 行；后面的位置【保持初始 -1】
                 #   -1 = 无效哨兵，kernel 遇到就跳过，所以不需要清零
+                #   量级（t=165, index_topk=512）：
+                #     page_indices / raw_indices : 165×512×4B ≈ 338 KB
+                #     topk_lengths               : 165×4B     ≈ 0.7 KB
                 tail_buf[: rows.shape[0]].copy_(rows)
         # ── ⑥ 换指针：从这一刻起，所有 self.forward_metadata 的读者看到的
         #        都是尾段那份（行数 = 尾行数）。这是"切换"的实质动作。

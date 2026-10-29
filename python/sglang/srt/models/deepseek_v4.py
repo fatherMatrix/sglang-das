@@ -4527,6 +4527,19 @@ class DeepseekV4Model(nn.Module):
                     if _is_hcu
                     else int(forward_batch.attn_cp_metadata.total_seq_lens)
                 )
+                # ★ 这里取的是 forward_batch.input_ids，不是上面被重绑的局部
+                #   变量 input_ids —— 这一点最容易看混：
+                #     · 局部 input_ids  ：已被 cp_round_robin_input_ids 切成
+                #                        rank-local（或 rank-major 重排）
+                #     · forward_batch.input_ids：整个 forward 都没被改过，
+                #                        仍是【切分前的全序列】
+                #   CP 只改"局部变量"，不改 batch 字段，所以全序列在这里还能拿到。
+                #
+                #   为什么必须用全序列：n-gram 哈希要看每个 token 的前 n-1 个前驱，
+                #   而前驱可能落在别的 rank 上。若只拿本地 token 算，
+                #   跨 rank 边界的那些 n-gram 全错（比例约 (n-1)/cp_size）。
+                #   EngramHasher 内部也有断言把这条写明：
+                #     "engram extend needs global token ids before CP sharding"
                 global_ids = forward_batch.input_ids[:total]
                 if self.engram_hasher.image_token_id is not None:
                     # forward_batch.input_ids misses the image-pad remap the

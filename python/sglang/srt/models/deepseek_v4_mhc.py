@@ -81,6 +81,63 @@ the kernel dispatch.
       它保证各流的总质量守恒：没有这个约束时，40 层连乘会让某些流被指数级
       放大、另一些被压到 0（mixing 矩阵的谱半径失控）。
 
+======================================================================
+流程图：V4.1 的融合到底发生在哪
+======================================================================
+  记号（比 pre/attn/post 更细，因为"用 pre"和"算 pre"是两步）：
+    M  mix stats : R → (pre, post, comb)      H·R + RMS + σ/Sinkhorn(20)
+    C  combine   : norm(Σ pre·R) → 子层输入
+    S  sublayer  : attn 或 ffn
+    P  post      : R' = post·y + comb·R
+
+  ── V4 Pro（无错位）：每步都串行，M 卡在关键路径 ──────────────────
+       M_k ─▶ C_k ─▶ S_k ─▶ P_k ─▶ M_{k+1} ─▶ C_{k+1} ─▶ …
+       （C_k 必须等 M_k 的 pre_k）
+
+  ── V4.1（错位）：M 走侧流，P_k 顺带做 C_{k+1} ────────────────────
+       main : C_k ─────▶ S_k ─────▶ P_k ─▶ C_{k+1} ─▶ S_{k+1} ─▶ …
+       side :        M_k(R_k)              M_{k+1}(R_{k+1})
+                     └ 与 S_k 并行         └ 与 S_{k+1} 并行
+       ↑ C_k 用的是 pre_{k-1}（上一层留下的），所以不必等 M_k
+
+  ── 一个层内的实际形状（融合边界用 ═ 标出）──────────────────────
+     ┌─ layer i ─────────────────────────────────────────────────┐
+     │  C_attn(用 pre_prev) ─▶ MQALayer ─▶ P_attn ═▶ C_ffn+norm   │
+     │        ▲                    MQALayer 内部含               │
+     │        │                    KV 写 + 稀疏注意力 + wo_a       │
+     │        │                                                   │
+     │   M_attn(侧流, 与 MQALayer 并行)                            │
+     │                                                            │
+     │  ── 下面是 ffn 段 ──                                        │
+     │  C_ffn 已在上一行的 ═ 里做完，这里直接拿去用 → S_ffn(MoE)    │
+     │  ─▶ P_ffn ═▶ C_{下一层 attn}+norm                           │
+     │        │                                                   │
+     │   M_ffn(侧流, 与 MoE 并行)                                  │
+     └────────────────────────────────────────────────────────────┘
+
+  ── 六个融合点，逐一标注在这张图上 ──────────────────────────────
+     ① M 内部三合一      H·R(GEMM) + RMS + σ门控 + Sinkhorn(20 轮)
+                          → mhc_pre / (HCU: rmsnorm_with_sinkhorn)
+     ② C 内部二合一      加权求和 + RMSNorm
+                          → hc_combine_norm
+     ③ P 内部二合一      外积(post·y) + 流间混合(comb·R)
+                          → mhc_post
+     ④ P_k ═ C_{k+1} + norm     ★ V4.1 特有的跨子层融合
+                          写完 R_{k+1} 立刻在同一 kernel 里做
+                          norm(Σ pre_k·R_{k+1})，返回 HcNormed；
+                          下一子层的 C 直接短路，一次 R_{k+1} 读写都不重复。
+                          → mhc_post_combine_norm_prefill（blackwell）
+                          → all_reduce_mhc_post_combine_norm（与 all-reduce 合并）
+     ⑤ P + 集合通信      注意力侧：all-reduce 的 epilogue 里做 P
+                          MoE 侧  ：finalize + shared add + all-reduce + P + C + norm
+                          （+量化）→ moe_finalize_all_reduce_mhc_post_combine_norm_quant
+     ⑥ 跨层 deferred     本层 P 推迟进下一层边界 kernel（gfx95）
+                          → hc_boundary_fused_deferred
+
+     注：④ 的 seam 分两种，对应 _init_boundaries 建的两个 boundary
+         local_boundary : ATTN[i] → FFN[i]      （层内）
+         next_boundary  : FFN[i]  → ATTN[i+1]   （跨层；Engram 层/尾段收窄时关闭）
+
   ★ 为什么"post + 下一层 combine + norm"能融合、而"post + 下一层 pre"不能：
       · 能：post 写完 R_{k+1} 之后，下一层的 combine 只需要
             norm(Σ pre_k·R_{k+1}) —— pre_k 此刻已经知道，R_{k+1} 就在手里，

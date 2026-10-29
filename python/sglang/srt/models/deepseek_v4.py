@@ -4602,6 +4602,21 @@ class DeepseekV4Model(nn.Module):
         #   进入前先 _check_late_layer_tail_readers 做护栏：要 prompt logprob /
         #   全量 prompt hidden 的请求直接拒绝（晚层没算那些行）。
         #
+        #   ★ 一个容易困惑的点：SWA 是逐请求、逐位置不同的，为什么这里
+        #     可以按【批】做决定？—— 两者不在同一层：
+        #       · 窗口本身：逐【行】表达。swa_topk_lengths[i] = min(128, 该行位置+1)、
+        #         窗口下界 floor 也是每行一个值、swa_page_indices[i] 每行一串页。
+        #         所以一个 kernel 天然能处理"各请求窗口长度不同"。
+        #       · "晚层要不要全量行"：只能批级，因为一次 forward 只有一个层循环、
+        #         一套张量形状。所以用 all() 保守判定：
+        #           _skips_late_layers 要求【每个】请求都还剩 ≥ SWA_WINDOW 个
+        #           prompt token 才整批跳过；只要有一个请求已经到最后一段，
+        #           就整批不跳（跑晚层）。
+        #       · 尾段长度本身也是逐请求的：min(128, extend_len)，靠 ragged
+        #         拼接 + extend_seq_lens 表达（例 extend=[200,37] → 尾长 [128,37]）。
+        #     混合批（部分请求已到末尾、部分还在中段）时退化为"多算一点"：
+        #     中段那些请求的尾行位置 > 128 之后才会被读到，写了也没人读，无害。
+        #
         #   ★ ③ 里为什么可以假定 tail_forward_metadata 非 None：
         #     它由 init_forward_metadata 按三个条件建：
         #        enable_decoder_swa_bounded_replay（等价于 late_layer_start 非 None）

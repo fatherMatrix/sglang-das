@@ -1101,6 +1101,35 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
       · HiCache 通过 get_kv_transfer_layout / *_layer_mappings 读取布局；
       · PD 通过 kv_args（指针 + item_len）搬数据。
     三者都不直接碰 buffer 内部，所以改布局时只需保证这三套接口一致。
+
+    ======================================================================
+    三套地址空间（读 translate_loc_from_full_to_swa / out_cache_loc 前必看）
+    ======================================================================
+
+      ┌ full（token 级）  0 .. full_size-1
+      │   这是"每个 token 一个编号"的统一坐标：req_to_token 里存的值、
+      │   out_cache_loc / raw_out_loc 的值都在这套空间里。
+      │   ★ 名字来自 full **attention**（覆盖全部历史），不是"完整副本"，
+      │     也不是"全部层"。V4.1 没有 full-attention 层（所有层都是窗口
+      │     注意力），所以这里【没有对应的数据 buffer】——它只是配额与编号：
+      │     分配器 full_attn_allocator 拿它做记账（kvcache 侧
+      │     getattr(pool,"full_kv_pool",None) 为 None）。
+      │
+      ├─ 压缩池 C1/C2      0 .. full_size//ratio-1
+      │   定位方式：compressed_slot = full_slot // ratio
+      │   （DSV4AttnMetadata 的注释原话："one latent per ratio tokens, at slot
+      │     raw_out_loc // ratio of the c1 / c2 pool"）
+      │   indexer 池类似，尺寸 (full_size + page_size) // ratio（多留一个
+      │   index padding page，因为保留了 FULL page 0）
+      │
+      └─ SWA 池            0 .. swa_size-1
+          定位方式：swa_slot = full_to_swa_index_mapping[full_slot]
+          这张表由分配器维护（分配时写、释放时清 0，末尾 -1 哨兵），
+          所以写 SWA KV 前必须"翻译"一次。
+
+      为什么需要翻译：同一个 token 在两个池里各占一个 slot，两套编号没有
+      线性关系（SWA 池容量小得多），只能查表。translate_loc_from_full_to_swa
+      就是这一次 gather。
     """
 
     # object.__new__ stubs (disagg wire test) skip __init__; False is the env

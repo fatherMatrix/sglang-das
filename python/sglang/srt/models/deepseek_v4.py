@@ -4941,8 +4941,16 @@ class DeepseekV4Model(nn.Module):
         #     · hash 路由（engram）：gate 直接拿 token id 算专家集合
         #         （mega_moe: topk_kwargs = {"input_ids": input_ids_global}
         #           if moe.is_hash else {}）
-        #     · 层内 MoE：注意力-DP 下每个 rank 只算自己那几个 token 的注意力，
-        #       但 MoE 要按 token 派发 → 必须有"槽位 → id"的完整对应
+        #     · 层内 MoE（仅当 attn_dp>1 且无 A2A，见 _run_moe_ffn_dp_sync 的
+        #       _use_tp_moe_gather）：
+        #         attention 只算【本 rank 的请求】→ hidden 只有 M_local 行；
+        #         但 MoE 必须看到【全局】token 才能产出每个 token 的专家分片，
+        #         所以那里先 dp_gather_replicate 成 M_global 行：
+        #             第 r 个 rank 的 local 行 → 全局 buffer 的 [start_r, start_r+M_local)
+        #         路由（尤其 hash 路由）是【按行查 id】：global_ids[i] 必须是
+        #         第 i 个槽位那个 token 的 id。
+        #         可手里只有 M_local 个 id —— 不拼成同一套槽位，第 i 行就查到
+        #         别的 token 的 id（或越界）。这就是"槽位 → id 一一对应"的含义。
         #   若某 rank 只握有局部 id，槽位号与 id 就对不上，路由会取到别的 token。
         #
         # 【为什么只在 attn_dp>1 且没有 A2A 时才做】

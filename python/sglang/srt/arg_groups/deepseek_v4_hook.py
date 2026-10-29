@@ -294,6 +294,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 or cfg.enable_decoder_swa_bounded_replay
             ),
         ),
+        # TBO 在 V4.1 上是【启动即拒绝】，而不是"开了但静默不生效"。
+        # 两个独立原因，任一都够：
+        #   ① V4.1 的层路径 _forward_layers_hc_pre_from_prev 里有
+        #      `assert not run_tbo` —— 这条 op 顺序本就不支持重叠执行；
+        #   ② DSpark 恒开捕获（spec_aux_hidden_state 里 DSPARK 分支无条件设
+        #      dflash_use_aux_hidden_state=True），而 _forward_layers_tbo 里
+        #      从来没有捕获钩子，导致 run_tbo = ... and not capture_dspark 恒 False。
+        # upstream v0.5.22 的同一个 unsupported 列表里也有这一条。
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
     )

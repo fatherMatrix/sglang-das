@@ -6113,6 +6113,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         #   `(_is_cuda or _is_npu)`，HCU 两者皆 False → 恒为 False。
         #   所以这个 with 在 HCU 上标志恒为 False，实际作用退化为"清 attn_inputs"。
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            # ★ 这里的变量名 hidden_states 有误导：它【不一定是张量】。
+            #   Model.forward 的返回有三种形态：
+            #     ① 非最后 PP stage → PPProxyTensors（交给 PP 调度器转发）
+            #     ② 最后 stage、无 aux 捕获 → (hidden, pre_hc_head)
+            #     ③ 最后 stage、有 aux 捕获 → ((hidden, pre_hc_head), aux)
+            #   ②③ 是"体输出元组"，故意整包往下传、不在这里拆，
+            #   由 logits_from_body_output 统一拆（见那里的 6145/6149/6158），
+            #   这样 PP 转发、CP-v2 runner、BCG 都能用同一个入口。
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )

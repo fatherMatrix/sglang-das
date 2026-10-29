@@ -4847,6 +4847,44 @@ class DeepseekV4Model(nn.Module):
         #   首 rank：embedding + mHC 通道复制（hidden 变成 [tokens, hc_mult, hidden]）。
         #     例外：HCU legacy CP 下若马上要切 token，可推迟复制，避免"先复制再切"的浪费。
         #   非首 rank：从 PP 通道取 hidden（2D），这里 unflatten 回 3D mHC 形状。
+        #
+        # ==================================================================
+        # 「推迟复制」这条捷径的七道门 + 两条下游出口
+        # ==================================================================
+        # 默认行为（else 分支）：
+        #     hc_broadcast(x, hc_mult): [T, H] → [T, hc_mult, H]，每个通道都是 x 的副本
+        #     （mHC 的初始 residual 需要 hc_mult 份相同的 hidden）
+        #   然后【块 ②】再按 CP 把手行切掉 7/8。于是先 materialize T×hc_mult 行、
+        #   再扔掉 7/8 —— hc_mult=4 时白写 3.5 份。
+        #
+        # 推迟路径（deferred_mhc_input）省掉的正是这部分：
+        #   先不复制，带着 2D 的 x 继续往下走，等 run_tbo 判定完（第 4950 行）再：
+        #     · not run_tbo → _repeat_mhc_input_on_cp_rank()
+        #         直接产出 [T/cp, hc_mult, H]：取行 + 复制通道一步完成
+        #         （LightOp 有融合 kernel mhc_repeat_cp_sglang，否则回退
+        #           x[cp_rank::cp_size].unsqueeze(1).repeat(1, hc_mult, 1)）
+        #         并置 mhc_cp_split_done=True，让块 ② 跳过 hidden 的切分
+        #         （positions/input_ids 仍要切，见块 ②）
+        #     · run_tbo → 退回朴素 repeat：TBO 先把【全行】分给孩子，
+        #       每个孩子在各自流里再切，融合不成立
+        #
+        # ★ 七道门（任一不成立就走 hc_broadcast）：
+        #     ① _FUSE_MHC_REPEAT_CP_SPLIT     环境变量开关，
+        #        默认 False（environ.py: SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT=EnvBool(False)）
+        #        → 本部署未设置，所以【默认走 else，不推迟】
+        #     ② _is_hcu                        只有 HCU 的 legacy CP 有这套融合
+        #     ③ use_prefill_cp                 本批是 prefill 且开了 CP
+        #     ④ not cp_v2_active               HCU 恒真（enable_cp_v2() 对 HCU 是 False）
+        #     ⑤ is_dsa_prefill_cp_round_robin_split()  interleave 切法（隔 cp_size 取 1）
+        #     ⑥ is_extend_without_speculative()       带投机的 extend 不算
+        #     ⑦ _can_defer_mhc_repeat_cp_split  —— 关键：要求"能证明无需 pad"
+        #          · hidden 是 2D、非空、hc_mult>0、cp_size>1、rank 合法
+        #          · num_tokens % cp_size == 0（否则切不匀，得 pad，就不融合）
+        #          · sum(extend_seq_lens_cpu) == num_tokens（CPU 元数据自洽，
+        #            不需要读设备值）
+        #          · _original_num_tokens 为空或等于 num_tokens（没被 pad 过）
+        #          · input_ids / positions / out_cache_loc 的行数都 == num_tokens
+        # ==================================================================
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)

@@ -5109,16 +5109,38 @@ class DeepseekV4Model(nn.Module):
         #   按固定层数预分配；PP>1 时是 list，交给 PP 通道转发）；
         #   PD 分离时随 KV 一起发给 D 侧。
         #
-        # 三个连带影响（都能在别处对上）：
-        #   · 禁用 TBO：run_tbo = self._can_run_tbo(...) and not capture_dspark
-        #     （重叠执行拿不到"逐层已完成"的 hidden）
-        #   · 尾段：捕获层若在 late_layer_start 之前，要先 tail.rows(aux) 取行，
-        #     否则与后面读取的行序不一致
-        #   · mid-chunk：层循环只跑到 end_layer，捕获列表要在循环外补齐
-        #     （块 13），否则 draft 侧缺层
-        #   · 与 bounded replay 的护栏相关：CaptureHiddenMode.FULL 且【不是】
-        #     DSpark 捕获时，_check_late_layer_tail_readers 会直接拒绝 ——
-        #     因为那种模式需要全部 prompt 行的 hidden，而晚层只算了尾行。
+        # 四个连带影响（都能在别处对上），逐条说清"为什么"：
+        #
+        #  ① 禁用 TBO：run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        #     ★ 这是【实现层面】的互斥，不是语义上不可能：
+        #       TBO 走的是另一条路径 _forward_layers_tbo（operations_strategy 的
+        #       op 图），那里【完全没有捕获代码】—— 它不做 eager 的逐层循环，
+        #       自然就没有"在本层注意力之前取 state.residual"这个钩子。
+        #       若不禁用，TBO 会被选中、捕获代码不执行 ⇒ dspark_aux_hidden_states
+        #       是空的/缺层，D 侧 draft 直接拿到错的东西。
+        #     ★ 而且 DSPARK 部署下这个禁用是【恒生效】的：
+        #       spec_aux_hidden_state 里 DSPARK 分支无条件设
+        #       config.dflash_use_aux_hidden_state = True，
+        #       于是 set_dspark_layers_to_capture 一定会被调用、dspark_layers_to_capture
+        #       非空（空列表会直接 ValueError），所以每批 prefill 都 capture_dspark=True。
+        #       ⇒ 即使加了 --enable-two-batch-overlap，DSpark 也永远不会真的跑 TBO。
+        #
+        #  ② 尾段要先取行：捕获层若在 late_layer_start 之前，那时还在跑全量行，
+        #     而晚层/尾段只算每请求最后 128 行；捕获的 hidden 最终要与尾段的
+        #     KV / 行序配套给 draft 用，所以先 tail.rows(aux) 对齐行集合，
+        #     否则形状对不上（而且行序不同 = 对应到错的 token）。
+        #
+        #  ③ mid-chunk 要在循环外补齐（块 13）：层循环只跑 [start_layer, end_layer)，
+        #     mid-chunk 时 end_layer 被截断到 late_layer_start；而捕获列表的长度
+        #     由 AuxHiddenStatePacker(len(集合)) 在开头就固定了。若不补，
+        #     draft 侧按"应有 N 层"去读就会缺层/错位，所以用当前 residual 补上
+        #     （这些行在后续任何读它们的地方之前，语义上仍是合法的填充）。
+        #
+        #  ④ 与 bounded replay 的护栏：_check_late_layer_tail_readers 里，
+        #     CaptureHiddenMode.FULL 且【不是】DSpark 捕获 → 直接拒绝。
+        #     因为 FULL 要"所有 prompt 行"的 hidden，而晚层只算了尾行，
+        #     那些行根本没被计算出来；DSpark 捕获被豁免，因为它只要集合内
+        #     那几层、而且已经按 tail 取过行。
         dspark_layers_to_capture = getattr(
             forward_batch, "pd_hidden_capture_layer_ids", None
         )

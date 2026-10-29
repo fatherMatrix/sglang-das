@@ -1437,6 +1437,29 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return resolve_compress_state_ring_size(compress_ratio)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        """把"full 池的 slot 号"翻译成"SWA 池的 slot 号"（一次查表 gather）。
+
+        ★ 为什么要翻译：V4/V4.1 有【两套并行的地址空间】
+
+            full 池：每个 token 一个 slot，承载
+                     · C1/C2（V4.1）或 C4/C128（V4 Pro）的压缩 KV
+                     · indexer 的 K
+            SWA 池 ：每个 token 一个 slot，但只保留"最近滑动窗口内"的行，
+                     容量比 full 池小得多（V4.1 还有 per-request ring 形态）
+
+          同一个 token 在两个池里各有一个 slot，编号【不是】同一套，
+          所以写 KV 时必须先翻译。
+
+        ★ 对应表由分配器维护，不在池里算：
+            full_to_swa_index_mapping 长度 = full 池 slot 数 + page_size + 1
+            · 分配时写入  mapping[full_slot] = swa_slot   （allocator/swa.py）
+            · 释放时清 0
+            · 末尾多一格 -1 哨兵：保证 last_loc == -1（没有前缀）翻译后仍是 -1
+
+        ★ 所以本函数等价于 `swa_slot = mapping[full_slot]`：
+            输入 (tokens,) int64 → 输出 (tokens,)，形状不变，逐元素查表。
+            调用方随后 .to(torch.int32) 是为了喂 kernel（int32 索引 ABI）。
+        """
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 

@@ -2676,8 +2676,19 @@ class DeepseekV4AttnBackend(
             forward_batch=forward_batch if cp_tail is not None else None,
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
-        # SWA 池与 full 池的地址空间不同：full 池的 slot 要翻译成 SWA 池落点。
-        # 例外是 encoder replay 的 request_window 模式 —— 那里直接给 write_loc。
+        # 尾段的 SWA 写落点。三种形态，按"池的地址空间"区分：
+        #
+        #   ① request_window 模式（encoder SWA replay）
+        #        layout.write_loc —— 已经是"请求私有环形缓冲"的行号，
+        #        不在 full 池的 slot 空间里，所以不用翻译。
+        #
+        #   ② 常规（本函数绝大多数情况）
+        #        translate_loc_from_full_to_swa(out_cache_loc)
+        #        = 查表 full_to_swa_index_mapping[full_slot]
+        #        （表由 SWA 分配器在分配/释放时维护，末尾有 -1 哨兵）
+        #
+        #   ③ 注意这里传的 out_cache_loc 是【尾行子集】（上面刚用 _tail_rows 取过），
+        #      不是整批的 forward_batch.out_cache_loc —— 晚层只写这些行。
         swa_out_cache_loc = (
             metadata.core_attn_metadata.request_window_layout.write_loc
             if self.token_to_kv_pool.request_window is not None
@@ -5918,7 +5929,39 @@ class DeepseekV4AttnBackend(
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle always re-translates at store time: its metadata may be stale, and
-        translating the zero-padded out_cache_loc writes to the dummy slot."""
+        translating the zero-padded out_cache_loc writes to the dummy slot.
+
+        ==================================================================
+        写 SWA KV 时的"目标 slot 从哪来" —— 三分支，优先级从上到下
+        ==================================================================
+        ① request_window 模式（encoder SWA replay）
+             self.token_to_kv_pool.request_window is not None
+             → 用 request_window_layout.write_loc
+               它已经是"请求私有环形缓冲"的行号（history_rows + offset），
+               不属于 full 池的 slot 空间，所以【不能也不需要】再翻译。
+               顺便 activate(layout)：把当前 layout 绑定到 window，
+               因为 write_loc 的有效性依赖"哪一个 layout 生效"。
+
+        ② 尾段（decoder SWA bounded replay）
+             metadata.late_layer_tail is not None
+             → 用 tail 自己那份 swa_out_cache_loc
+               原因：晚层的 q 行只是整个 extend 的一个子集（每请求最后 128 行），
+               若沿用 forward_batch.out_cache_loc，长度就是整批、对不上。
+
+        ③ 常规路径
+             优先用元数据里缓存的 core.swa_out_cache_loc
+               （init_forward_metadata_prefill 里已经翻译好的那份）；
+             但三个前提任一不满足就现场重翻：
+               · cached is None（没建过，例如 idle 批）
+               · 是 idle 批（元数据可能是旧的，且 out_cache_loc 是零填充，
+                 翻译后会写到 dummy slot）
+               · cached 长度与 out_cache_loc 不一致（批大小变了）
+
+        写到哪：调用方（MQALayer._forward_prepare 的融合分支 / store_cache）
+        把它作为 swa_loc 传给 fused_qk_norm_rope_swa_store，由 kernel 直接
+        按行号写 SWA 池 —— 所以这个张量就是"每一行 K/V 该落哪个 slot"。
+        ==================================================================
+        """
         metadata = self.forward_metadata
         if self.token_to_kv_pool.request_window is not None:
             layout = metadata.core_attn_metadata.request_window_layout

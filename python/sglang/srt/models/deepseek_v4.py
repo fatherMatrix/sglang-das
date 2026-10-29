@@ -4719,6 +4719,29 @@ class DeepseekV4Model(nn.Module):
             # 【块 8】Engram 注入：把 n-gram 记忆加进残差（只在本层配置了 engram 时）。
             #   V4.1 的多模态特例：图像占位 token 保留 engram 之前的值。
             #   尾段模式下不需要额外取行——此处 state 已是尾段。
+            #
+            # ★ engram(...) 最终落到哪（三层，都是"查表 + 线性 + gated add"）：
+            #     self.layers[i].engram(...)                layers/engram.py  Engram.forward
+            #       ├─ ① self.embed(hash_ids, ...)          EngramEmbedding.forward
+            #       │       └─ engram_gather(...)           kernels/ops/embeddings/engram_gather.py
+            #       │          输入 fp8 e4m3 表 + e8m0 block scale，
+            #       │          gather 时按块反量化成 bf16（零行 = id 不在本分片）
+            #       │     shared 布局：整表一次 gather
+            #       │     非 shared   ：每 TP rank 只查自己那段行 → 未拥有填 0
+            #       │                   → all_reduce 合并（恰好一份非零）
+            #       │     CP(=cp_all_tokens)：先在 CP 组 all_gather【索引】，
+            #       │                  各 rank 用同一批索引查表，再取本 rank 切片
+            #       │     DP-attention：先用 get_global_dp_buffer_len 把各 rank 索引拼起来
+            #       ├─ ② self.wkv(emb.flatten(-2))          ReplicatedLinear（MXFP8 GEMM）
+            #       │     [T, n_cols, dim] → [T, n_cols*dim] → [T, (hc_mult+1)*dim]
+            #       └─ ③ engram_gate(x, kv, q_weight, k_weight, eps, clamp)
+            #              └─ fused_engram_gate(...)        kernels/ops/embeddings/engram_gate.py
+            #                  kv 的布局 = hc_mult 个 key + 1 个共享 value；
+            #                  每个 hc 通道用各自的 key 与那个 value 算 gate，
+            #                  于是【同一个 value 被加进所有通道副本】。
+            #
+            #   hash_ids 形状 [T, n_engram_layers, n_hash_cols]，
+            #   这里 [:, engram.layer_hash_index] 取【本层这一列】→ [T, n_hash_cols]。
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual

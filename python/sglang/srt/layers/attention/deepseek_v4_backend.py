@@ -2975,7 +2975,59 @@ class DeepseekV4AttnBackend(
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
         """Switch the late layers onto the tail; the return value goes back to
-        exit_late_layer_tail."""
+        exit_late_layer_tail.
+
+        ==================================================================
+        ★ 尾段元数据是【另一个对象】，不是"覆盖"也不是"在原对象上加字段"
+        ==================================================================
+        一次 forward 里同时存在两份 DSV4Metadata：
+
+            self.forward_metadata       ← 整批版（L0..L20 期间用）
+            self.tail_forward_metadata  ← 尾段版（L21..L39 期间用）
+
+        本函数做的是"换指针"：把 self.forward_metadata 指向尾段对象，
+        exit_late_layer_tail 再还原。所以：
+
+          · 整批对象不会被改写，退出后原样可用
+          · 尾段对象在一次 forward 内只构造一次（共 1~2 次调用，见
+            _build_late_layer_tail_metadata 的 docstring），之后反复切换
+
+        ── 尾段对象里有什么 ───────────────────────────────────────
+        【A】全新构造（独立显存，与整批版互不影响）
+             core_attn_metadata.page_table / seq_lens_casual / positions_casual
+             core_attn_metadata.req_pool_indices_repeated
+             core_attn_metadata.swa_page_indices / swa_topk_lengths
+             core_attn_metadata.raw_out_loc / swa_out_cache_loc / c1_out_loc / …
+                 （都只覆盖尾行）
+             core_attn_metadata.c1/c2_sparse_page_indices / _topk_lengths /
+                 _raw_indices、*_flashmla_metadata      （按尾段行数重新分配）
+             core_attn_metadata.request_window_layout  （若有 request_window）
+             low_ratio_req_indices / low_ratio_pos_i64 （每行的请求号与位置）
+             late_layer_tail（LateLayerTail：token_indices / positions /
+                 swa_out_cache_loc / pad_rows / cp_metadata / local_lens / …）
+             indexer_metadata / c1,c2_indexer_metadata / c4,c128_compress_metadata
+                 → V4.1 非图 prefill 全为 None
+
+        【B】从整批对象"拷过来"的两处桥接（下面代码里能看到）
+             ① sparse top-k 三件套（page_indices / topk_lengths / raw_indices）：
+                L0..L20 已经算好 top-k，晚层直接用，按 tail.real_rows() 取行
+             ② candidate_metadata（request_masks / request_block_ids）：
+                按 tail_lens 取每请求末尾 t 行
+
+        【C】不复制、共享同一份（只读源或全局单例）
+             token_to_kv_pool（KV 池本身）、req_to_token、page_table 的源表、
+             forward_batch.positions / seq_lens
+             —— 它们只是"数据来源"，不属于任何一份元数据
+
+        ── 切换时改动的全局状态（必须在 exit 里还原）────────────
+             self.forward_metadata          ← 存进 saved[0]
+             forward_batch.attn_cp_metadata ← 存进 saved[1]
+             get_local_dp_buffer_len()      ← 存进 saved[2]
+          另外两处"不还原、而是重新选"：
+             request_window.activate(尾段的 request_window_layout)
+             LayerSplit 池 reset_batch_active_pages()
+                （整批的选页缓存是按整批行算的，尾段读别的行，必须作废）
+        =================================================================="""
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (

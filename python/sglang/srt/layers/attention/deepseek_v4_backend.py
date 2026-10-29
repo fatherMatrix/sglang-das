@@ -3125,6 +3125,14 @@ class DeepseekV4AttnBackend(
              【整批】元数据的 buffer；晚层要用同一批结果，所以按
              tail.real_rows(...) 把尾行拷进【尾段】元数据的 buffer，
              其余位置保持 -1（padding）。
+             ★ 晚层为什么要用：V4.1 prefill 的注意力 = 本行 SWA 窗口
+               + "选中的 top-k 个压缩块"。选块结果就存在这三件套里
+               （page_indices 给稀疏 kernel 用、raw_indices 给 workspace
+               做 rebase），晚层读压缩 KV 时必须沿用它。
+             ★ 为什么不重算：这些索引是【按 ratio 跨层共享】的
+               （fill_all_compressed_indices 的注释："Share the full-position
+               indices across layers of this ratio"）。重算会选出不同的块，
+               早层已建好的 workspace 就会错位。
           ④ 换指针：self.forward_metadata = tail_metadata
           ⑤ 三处"不还原、而是重设"的全局状态：
                · request_window.activate(尾段 layout)   ← encoder replay 的环形缓冲

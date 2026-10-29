@@ -5155,6 +5155,38 @@ class DeepseekV4Model(nn.Module):
         capture_dspark = dspark_layers_to_capture is not None
         # Under CP-v2 the body returns rank-local hidden/aux rows; the CP runner
         # gathers them and finishes through DeepseekV4ForCausalLM.logits_from_body_output.
+        #
+        # ==================================================================
+        # 「收集器」二选一：打包器（预分配） vs 普通 list
+        # ==================================================================
+        # 后面每命中一个捕获层就要 .append(一份 mean 后的 hidden)，共 K 份
+        # （K = len(dspark_layers_to_capture)，已按 PP stage 过滤）。
+        # 两种容器都能接 append，但内存行为不同：
+        #
+        #   ① AuxHiddenStatePacker(K)  ← capture_dspark 且 PP 单 stage 时
+        #        首次 append 时按 [tokens, K*hidden] 一次性开好缓冲，
+        #        之后每份直接写进 [..., idx*hidden : (idx+1)*hidden]，
+        #        不产生中间 list，也不需要最后的 torch.cat。
+        #        finalize() 直接返回这块缓冲（零拷贝），
+        #        并断言 _idx == K —— "少捕获一层"会在这里当场报错。
+        #
+        #   ② list(incoming_pd_aux_hidden_states)  ← 其余情况
+        #        PP > 1：前面 stage 已经把自己的特征经 IPC 传过来了，
+        #                本 stage 只往后 append 自己那几层（见块 8 按
+        #                pd_aux_hidden_states_{idx} 逐个转发）。
+        #                此时 K 是"本 stage 的层数"，与全局 K 不同，
+        #                所以不能用打包器（它的 num_captures 是固定语义）。
+        #        未开捕获：空 list，后面根本不会 append，零开销。
+        #
+        # ★ 为什么不用打包器就不能省那次 cat：
+        #     list 路径最终要在块 7 之后 torch.cat(K 份) → 瞬时有 2×K×hidden
+        #     的 HBM 峰值；打包器把这一步摊到每次 append 上，峰值只有 1×。
+        #
+        # ★ 为什么条件里要 pp_world == 1：
+        #     set_dspark_layers_to_capture 会把 layer_ids 过滤成"落在本 PP
+        #     stage 内"的那些，所以 PP>1 时每个 stage 的 K 是本地的；
+        #     打包器的 fixed num_captures 语义要求"一次 forward 收齐全部
+        #     K 层"，只有单 stage 才成立。
         use_packed_pd_aux = capture_dspark and self.pp_group.world_size == 1
         pd_aux_hidden_states: AuxHiddenStateAccumulator = (
             AuxHiddenStatePacker(len(dspark_layers_to_capture))

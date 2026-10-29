@@ -177,6 +177,27 @@ class NonPagedIndexerPlan:
 
 @dataclass
 class PagedIndexerMetadata:
+    """indexer（top-k 检索）的输入描述，粒度是【压缩域】而非 token 行。
+
+    ★ 在层次里的位置（详见 deepseek_v4_backend.DSV4Metadata 的类注释）：
+        AttnBackend.forward_metadata : DSV4Metadata
+          ├─ core_attn_metadata   ← 粒度：每 token 行（注意力 kernel 读它）
+          └─ indexer_metadata     ← 本类，粒度：压缩域（只给 indexer 打分用）
+
+      并且同样只有 1 个实例，不是"每压缩块一个对象"；字段的第 0 维是压缩域
+      行数（≈ ceil(seq/ratio)，按请求算）。
+
+    ★ 为什么 CP 重排后只能重建、不能切片：
+        · page_table 是从 core.page_table **展开**出来的（见
+          expand_index_page_table）：一个 full page 展开成若干 64-slot 索引块，
+          展开后的结构不是"行"的直接函数；
+        · compressed_seq_lens 是**按请求**的压缩长度，行被切走 7/8 后推不出来。
+
+    ★ V4.1 的使用面很窄：ratio 1/2 走 c1/c2_indexer_metadata（在
+      DSV4Metadata 上平铺，不在本类里区分），且只在 decode 与 prefill
+      图捕获时构造；prefill 非图路径恒为 None（has_c4=False）。
+    """
+
     page_size: int
     compressed_page_size: int
     page_table: torch.Tensor

@@ -582,6 +582,43 @@ def _copy_or_replace(dst, src):
 
 @dataclass
 class DSV4AttnMetadata:
+    """一次 forward 的"每 token 行怎么读 KV"（core 元数据）。
+
+    ★ 先纠正一个最容易产生的误读：**这个类只有 1 个实例**，不是"每个 token
+      一个对象"。所谓"粒度 = 每 token 行"，说的是它里面每个张量字段的
+      第 0 维长度 = token 行数。取值写法是 t[i]（张量第 i 行），不是 obj[i]。
+
+        N = 3000 时：
+          DSV4AttnMetadata          ← 1 个实例
+            ├─ seq_lens_casual      torch.Size([3000])       3000 行
+            ├─ positions_casual     torch.Size([3000])       3000 行
+            ├─ page_table           torch.Size([3000, 12])   3000 行 × 12 列
+            └─ swa_page_indices     torch.Size([3000, 64])   3000 行 × 64 列
+
+      做成"一 token 一对象"既不可能也没必要：kernel 要连续张量、图捕获要固定
+      形状，而对象列表两样都给不了。
+
+    ★ 字段按"家族"分组（V4.1 只有 c1/c2，V4 Pro 只有 c4/c128）：
+        基础       page_size / page_table / index_topk / present_ratios / low_ratios
+        因果       seq_lens_casual / positions_casual
+        SWA        swa_page_indices / swa_topk_lengths / swa_out_cache_loc
+        写落点     raw_out_loc / c1_out_loc / c2_out_loc / c4_out_loc / c128_out_loc
+        长度       c1..c128_topk_lengths_clamp1 / c128_page_indices
+        稀疏工作区 c{1,2,4}_sparse_{page_indices, raw_indices, topk_lengths}
+        调度       c{0,1,2,4,128}_flashmla_metadata
+        合并表     trtllm_*（decode / prefill 各一套，给 TRT-LLM 后端用）
+        窗口       request_window_layout（encoder replay）
+
+    ★ 两组字段在 CP 重排时待遇不同（见 apply_cp_reindex）：
+        读侧（page_table / seq_lens_casual / positions_casual / swa_*）
+            → 按行切片，变成 N/cp_size 行
+        写侧（*_out_loc）
+            → 不切，保持全局 N 行（压缩器要按全局顺序写整段状态）
+
+    本类挂在 DSV4Metadata.core_attn_metadata 下；一份 forward 有"整批"和
+    "尾段"两个 DSV4Metadata，所以最多同时存在 2 个本类实例。
+    """
+
     page_size: int
     page_table: torch.Tensor
     raw_out_loc: torch.Tensor
@@ -1244,8 +1281,9 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     """Rows the layers after the last kv_source layer run over under decoder SWA
     bounded replay: the last tail tokens of each request in the extend.
 
-    ★ 粒度说明（容易误解成"一请求一份"，其实不是）
-    这是【一个批一份】的元数据，内部用"ragged 拼接 + 每请求长度"表达多请求：
+    ★ 粒度说明（容易误解成"一请求一份"或"一 token 一个对象"，其实都不是）
+    这是【一个批一份】的元数据（一次 forward 只有 1 个实例），
+    内部用"ragged 拼接 + 每请求长度"表达多请求：
 
       批级 / 每-forward 一份
         __ 对象本身：每次 init_forward_metadata 重建一次
@@ -1335,10 +1373,36 @@ class _LowRatioDenseMetadata:
 @dataclass
 class DSV4Metadata:
     # ==================================================================
-    # 一次 forward 的"注意力契约总包"。里面是两类不同粒度的元数据：
+    # 一次 forward 的"注意力契约总包"。先说层次，再说各部分分工。
     #
+    # 【对象树】AttnBackend 每个 worker 一个实例，上挂两份本类对象：
+    #
+    #   AttnBackend
+    #    ├─ forward_metadata : DSV4Metadata            ← 整批（runner 里 ① 建）
+    #    │    ├─ core_attn_metadata : DSV4AttnMetadata        粒度：每 token 行
+    #    │    ├─ indexer_metadata : PagedIndexerMetadata      粒度：压缩域（ratio 4）
+    #    │    ├─ c1_indexer_metadata / c2_indexer_metadata    粒度：压缩域（V4.1）
+    #    │    ├─ c4_compress_metadata / c128_compress_metadata  V4 Pro 压缩器状态
+    #    │    ├─ low_ratio_req_indices / low_ratio_pos_i64 / low_ratio_query_lens
+    #    │    ├─ low_ratio_dense_metadata : Dict[ratio, _LowRatioDenseMetadata]
+    #    │    ├─ q_pad_buffer / candidate_metadata / sparse_prefill_cache
+    #    │    └─ late_layer_tail : LateLayerTail              通常为 None
+    #    └─ tail_forward_metadata : DSV4Metadata       ← 尾段（② 建，③ 可能覆盖）
+    #         └─ late_layer_tail 非 None；其余同构，只是行数小（尾行）
+    #
+    #   另一棵独立的树（不在本类里）：
+    #     ForwardBatch.attn_cp_metadata : ContextParallelMetadata
+    #                                    | InterleaveContextParallelMetadata
+    #     它描述"token 怎么分给各 rank"，与"怎么读 KV"是两件事，所以分开挂。
+    #
+    # 【两个正交维度】定位任何字段都靠这两维：
+    #     维度 A 行集合：整批 / 本 rank / 尾段        → 用哪一份 DSV4Metadata
+    #     维度 B 粒度  ：每 token 行 / 压缩域 / 每请求 → core / indexer / cp_metadata
+    #   例：A=整批 + B=压缩域 → indexer_metadata，CP 之后只能"重建"不能切片。
+    #
+    # 【内部两类元数据的分工】
     # ① core_attn_metadata（DSV4AttnMetadata）—— "每个 token 行怎么读 KV"
-    #      按【本 rank 的 token 行】组织：
+    #      按【本 rank 的 token 行】组织（1 个实例 + 每字段一张表，非每 token 一对象）：
     #        page_table        每行 = 该 token 所属请求的 KV 页号列表
     #                          （= req_to_token[req, ::page_size] // page_size）
     #        seq_lens_casual   每行的因果长度（该 token 在序列里的位置+1）
@@ -1361,6 +1425,11 @@ class DSV4Metadata:
     # 所以 CP 重排时，core 的 per-token 字段可以直接按行切片（apply_cp_reindex），
     # 而 indexer 元数据必须用 init_forward_metadata_indexer 重新构造
     # （展开后的页号、按请求的压缩长度都随行集合变化）。
+    #
+    # 注：V4.1 的 present_ratios=(1,2) → has_c4=False → 本类里的
+    # indexer_metadata / c4_compress_metadata / c128_compress_metadata 全为
+    # None；V4.1 的低压缩比 indexer 元数据走 c1/c2_indexer_metadata
+    # （且只在 decode 与 prefill 图捕获时存在）。
     # ==================================================================
     core_attn_metadata: DSV4AttnMetadata
     indexer_metadata: Optional[PagedIndexerMetadata]

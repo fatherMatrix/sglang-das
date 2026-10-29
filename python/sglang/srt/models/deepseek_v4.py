@@ -5333,8 +5333,8 @@ class DeepseekV4Model(nn.Module):
                 dspark_layers_to_capture,
             )
         # 【块 5'】TBO 路径：层内自包含，不做跨层 mHC 融合，所以没有尾部的 hc_post。
-    #   对 V4.1 不可达：第一条分支已被配置选中，而它 assert not run_tbo，
-    #   即"V4.1 + TBO"是一个未接线的组合（开了会直接断言失败）。
+        #   对 V4.1 不可达：第一条分支已被配置选中，而它 assert not run_tbo，
+        #   即"V4.1 + TBO"是一个未接线的组合（开了会直接断言失败）。
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -5449,6 +5449,35 @@ class DeepseekV4Model(nn.Module):
 
         # 【块 9】最后一个 stage 的收尾：hc_head（把多通道合并）+ 最终归一化。
         #   之后交给 ForCausalLM 出 logits；bounded replay 下这里的行数只是每请求尾行。
+        #
+        # ==================================================================
+        # 为什么要把 pre_hc_head 一起返回
+        # ==================================================================
+        # 它是什么：
+        #   此刻 hidden_states 还是 mHC 的【多通道残差】[tokens, hc_mult, hidden]，
+        #   flatten(1) 后是 [tokens, hc_mult*hidden] ——
+        #   这是 hc_head 合并（hc_combine）之前、也是最终 RMSNorm 之前的状态。
+        #
+        # 谁需要它、为什么不能用后面的 hidden_states：
+        #   output 侧有 CaptureHiddenMode（FULL / LAST，spec decode 与训练管线用）：
+        #   要的是"最后归一化之前"的残差，因为 draft（EAGLE/DFlash/DSpark）与
+        #   训练时见过的是这个分布；喂已 hc_combine + norm 的向量分布就不对了。
+        #   logits_processor 里的规则很明确：
+        #       若给了 hidden_states_before_norm，就【总是优先返回它】
+        #   （logits_processor._maybe_store：\"when hidden_states_before_norm is
+        #     provided, we always prefer to return it\"）。
+        #
+        # 三个连带处理（都在下面几十行里）：
+        #   ① CP：它是按行的，必须和 hidden_states 一起 gather（否则行序错位）
+        #   ② bounded replay：它是尾行子集，要用 _scatter_*_tail_rows 散回
+        #      完整 extend 布局 —— 下游按"每请求最后一行"取数
+        #   ③ DSpark 捕获开启时置 None：那时 aux hidden 取代它
+        #      （见 5481 行注释 \"replaces pre-HC states in logits_from_body_output\"）
+        #
+        # 返回值形态：
+        #   正常           → (hidden_states, pre_hc_head)
+        #   有 aux 捕获时  → ((hidden_states, pre_hc_head), aux_hidden)
+        # ==================================================================
         pre_hc_head = hidden_states.flatten(1)
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
@@ -6149,6 +6178,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
             logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
 
+        # hidden_states_before_norm 只在 need_capture 时被用到：processor 会
+        # 优先返回【未过最终 norm】的版本（draft/训练期望的分布）。
+        # 有 aux（DSpark 捕获）时传 None，因为此时返回的是 aux 特征而不是 pre-HC。
         output = self.logits_processor(
             input_ids,
             hidden_states,

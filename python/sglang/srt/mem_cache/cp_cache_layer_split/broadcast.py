@@ -32,6 +32,34 @@ def get_pynccl_broadcast_comm():
     return pynccl_comm
 
 
+# 【BroadcastSlots】把"owner 广播"从主流程里摘出来的旁路流机制。
+#
+#   为什么需要它：LayerSplit 的每一层都要把"该层读集合涉及的页"从 owner rank
+#   广播给其它 CP rank。如果这条广播排在主流程（当前 stream）上，它就和
+#   本层的 Q/attention 严格串行；排到旁路流（side stream）上，则可以与
+#   上一层/本层前半段的计算重叠，只要保证"真正读 staging 之前等它完成"。
+#
+#   三个动作构成一条有序的依赖链（每个 kind 一个槽，互不干扰）：
+#
+#     launch(kind, layer)  ── ① clear(kind)：先等上一次用同一槽的广播做完
+#                             ② pending.stream.wait_stream(main stream)
+#                                （旁路流等主流程把数据准备好，例如 owner 拷贝）
+#                             ③ 切到 pending.stream 执行 with 块（广播本身）
+#     finish(kind, layer)  ── 校验 layer 一致（防止错层消费），再 clear(kind)
+#     clear(kind)          ── main stream.wait_stream(pending.stream)
+#                             （主流程等广播完成，之后才允许读 staging）
+#
+#   两个使用要点：
+#     · launch 内部会先 clear；所以"同槽复用"天然安全，但每层只能用一次槽。
+#     · clear/finish 只对"当前 stream"建依赖。这正是 HiCache 恢复能复用它
+#       的原因：恢复在 H2D stream 上下文里调用池的
+#       invalidate_staging_for_hicache()，于是 current_stream() 就是 H2D 流，
+#       "H2D 等所有在飞行的广播" 被写成了一条普通的 stream 依赖，
+#       逐层 restore 才安全落盘（见 l2_transfer.py 的 submit_host_to_device）。
+#
+#   与静态选页的关系：只有 static_size 已知（nonzero_static）时，
+#   async_pages 才能打开（deepseek_v4_pool.py:979-983）；
+#   动态 nonzero 已经同步过主机，再排旁路流没有意义，只会多一层簿记开销。
 class BroadcastSlots:
     """Per-pool slot registry for in-flight LayerSplit broadcasts."""
 

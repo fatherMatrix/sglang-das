@@ -4582,11 +4582,42 @@ class DeepseekV4Model(nn.Module):
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
         # 【块 4】decoder bounded replay 的分支：决定本次层循环跑到哪一层、
         #   以及是否要在中途把行数切换到"尾段"。
-        #     · 未开 replay        → end_layer = 全部层，tail = None
-        #     · 开了且在跑中段 chunk → attn_backend.skip_late_layers 为真，
-        #                             直接不跑晚层（这些行没人读）
-        #     · 开了且是最后一段    → 取 late_layer_tail，到 late_layer_start 时切行
-        #   进入前先调 _check_late_layer_tail_readers 做正确性护栏。
+        #
+        #   两种"早停"各不相同，别混：
+        #     · end_layer < self.end_layer → 后面的层【根本不执行】（mid-chunk）
+        #     · tail != None              → 层照跑，但在 late_layer_start 处
+        #                                   【把行换成尾段】（最后一段 chunk）
+        #
+        #   三分支：
+        #     ① 未开 replay（late_layer_start is None）
+        #          end_layer = 全部层，tail = None —— 普通全量 prefill
+        #     ② 开了 + 本批是中段 chunk（skip_late_layers 为真）
+        #          end_layer = late_layer_start —— 晚层这些行没人读，直接不跑
+        #          判据见 _skips_late_layers：每请求在本 chunk 之后还有
+        #          ≥ SWA_WINDOW 个 prompt token
+        #     ③ 开了 + 本批是最后一段
+        #          tail = tail_forward_metadata.late_layer_tail，
+        #          到 late_layer_start 时按 tail.rows 切行（见块 7）
+        #
+        #   进入前先 _check_late_layer_tail_readers 做护栏：要 prompt logprob /
+        #   全量 prompt hidden 的请求直接拒绝（晚层没算那些行）。
+        #
+        #   ★ ③ 里为什么可以假定 tail_forward_metadata 非 None：
+        #     它由 init_forward_metadata 按三个条件建：
+        #        enable_decoder_swa_bounded_replay（等价于 late_layer_start 非 None）
+        #        and is_extend_without_speculative()
+        #        and not skip_late_layers
+        #     与这里进 ③ 的条件完全镜像，所以成立。
+        #
+        #   ★ is_extend_without_speculative()（forward_batch_info.py）：
+        #        is_extend() and not is_target_verify()
+        #     is_extend() 包含 {EXTEND, MIXED, TARGET_VERIFY, SPLIT_PREFILL,
+        #     DLLM_EXTEND}（DRAFT_EXTEND_V2 默认不算），而 TARGET_VERIFY 是
+        #     投机验证步 —— 它也叫"extend"，但不是新 prompt，没有"晚层只算
+        #     尾行"的语义（_can_run_tbo 的注释也点了这条 "MTP target-verify
+        #     also reports is_extend()"）。所以要减掉它。
+        #     注意 MIXED（chunked prefill 里含 decode）仍在这个集合里，
+        #     而 _skips_late_layers 内部只认 == EXTEND，所以 MIXED 会走 ③。
         tail = None
         end_layer = self.end_layer
         if (

@@ -970,12 +970,22 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             and num_reqs is not None
             and getattr(self, "request_window", None) is None
         ):
+            # 唯一一个"估算型"静态入口：read_indices 为 None 时只能拿
+            # read_token_capacity（按 seq_len/ratio 折算的 token 数上界）。
+            # 典型场景是 bounded replay 的尾层：它只能选到整条历史里的任意位置，
+            # 无法物化 chunk cache 拿精确槽位（对比上面 cache 分支的 flat_token_ids）。
+            #   代价：上界只保证"token 数"，不保证"段数"——恢复打散槽位后，
+            #   同一批 token 的段数可能超过 +2 余量（见 staging.py 中
+            #   contiguous_request_page_capacity 的 ★★ 段）。
             static_size = contiguous_request_page_capacity(
                 read_indices.numel() if read_indices is not None else read_token_capacity,
                 num_reqs,
                 pool.page_size,
                 max_pages,
             )
+        # 只有静态 size 才谈得上异步：动态 nonzero 已经把主机卡在形状同步上。
+        # 注意 reuse_full_read 时不能异步——同一份 source 的取数可能被别的 rank
+        # 复用，先 clear 掉在飞行的广播再整段重发（见上面 :963-965）。
         async_pages = (
             not reuse_full_read
             and static_size is not None

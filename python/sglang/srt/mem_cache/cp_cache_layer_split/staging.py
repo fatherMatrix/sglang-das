@@ -62,6 +62,25 @@ def contiguous_request_page_capacity(
       是一段"（extend + 其前滑窗），而不是"物理页连号"。
       调用方传进来的 total_tokens 已经按 min(seq_len, extend + window - 1)
       折算过，正是为了维持这个前提。
+
+    ★★ 这个前提会被 HiCache 的 load_back 打破（2026-10-26 起，devel 分支）：
+
+      恢复时 `_allocate_external_slots` 从空闲链整块取页（paged.py 的
+      alloc → free_pages[:n]），与请求已有前缀之间**没有续页语义**
+      （对比 alloc_extend 的 last_loc+1 续页）。于是同一个请求的 KV 变成
+      "L1 前缀一段 + 恢复块一段 + 后续 extend 一段 + 部分释放留下的空洞"。
+
+        页数仍然 = ceil(总 token 数/ps) + 半满页数；
+        而半满页数 ≈ 段数 D_r —— 不再受"每请求 ≤2"约束。
+
+      也就是说：使上界失效的不是"页号变散"（页号一直是散的，整页分配下无害），
+      而是**段数变多**。当真实活跃页数 > static_size 时，nonzero_static
+      只会保留前 static_size 个（静默截断、无断言），remap 把溢出页映射成 -1，
+      attention kernel 直接跳过 → 读到缺键的记忆。
+
+      这正是 C.4 在组合期强制退动态 nonzero 的原因
+      （deepseek_v4_pool.py 的 _LS_HICACHE_BOUNDED_REPLAY 门控），
+      也是"段计数方案"要补的洞：把 D_r 记账并加进 extra_segments。
     """
     if total_tokens == 0:
         return min(max_pages, 1)

@@ -3101,6 +3101,42 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
+            # ★ 这不是"V4.1 不能融合"，而是【融合对象换了】，必须关掉旧的那个。
+            #
+            #   两种 fusion 的"输入"根本不同：
+            #
+            #   ① use_fused_mhc_post_pre（V4 Pro）—— post + 下一层 pre
+            #        子层 k 的 post 写回 R'，子层 k+1 的 pre 再读 R' 算系数。
+            #        两者都读同一份 R'，所以能合成一个 kernel：
+            #             读 R' → 写 R'（post 混合）+ 算 pre 系数（Sinkhorn 等）
+            #        省一次 R' 的全量往返（hc_mult×hidden = 4×5120 个 float/token）。
+            #
+            #   ② V4.1 的 single-pass mHC —— pre 在【post 内部】就算完了
+            #        cfg.pre_from_prev=True 后，post 的返回值里就带着
+            #        下一个子层的 pre（HcState(updated, pre, ...)），
+            #        而且这份 pre 用的是"错位一个 block"的统计量（A.4 的设计）。
+            #        边界处已经【没有 pre 要算】了 —— 若再跑 ① 的融合 kernel，
+            #        等于算第二遍，且两遍的输入不同（新旧 residual）→ 数值不一致。
+            #
+            #   ⇒ 所以关掉 ① 是语义正确性要求，不是平台限制。
+            #
+            #   V4.1 换成了另外三种融合（都在下游，按平台条件生效）：
+            #     a. post + 下一层 combine+norm
+            #          _post_fusion 里 cfg.pre_from_prev 是【前置条件】，
+            #          命中时调 mhc_post_combine_norm_prefill，返回 HcNormed；
+            #          于是下一个 combine 直接短路（combine 里
+            #          `if isinstance(shortcut, HcNormed): return shortcut.rows`）。
+            #          集合通信版：all_reduce_mhc_post_combine_norm。
+            #          （该 kernel 目前带 blackwell + 4096≤rows≤65536 等条件）
+            #     b. Mega mHC（HCU 专属）
+            #          _use_hcu_hc_mix_stats = is_hcu and SGLANG_USE_LIGHTOP
+            #              and SGLANG_HCU_HC_MIX_STATS_OPT
+            #          命中时把 hc_attn_fn/hc_ffn_fn（24×20480）预先切成
+            #          tf32/bf16 两部分（split_tf32_hc_weight /
+            #          split_bf16_hc_weight），mixing 统计走 lightop。
+            #     c. gfx950 的跨层 deferred post（块 11：
+            #          hc_boundary_fused → forward_layer_fused_boundary）
+            #          把本层 MoE 的 post 推迟进下一层边界 kernel。
         if _is_hip:
             _hip.init_decoder_layer(self, quant_config)
         self.hc_cfg = mhc.HcConfig(

@@ -3761,24 +3761,70 @@ class DeepseekV4DecoderLayer(nn.Module):
           run_ffn_hc  ：combine(pre) → MoE   → run_moe_post （产生下一个 pre）
         注意 seam_open=False 时不给下一层预算 pre——因为晚层尾段会把行数收窄，
         预先算好的 pre 就不再描述这些行。"""
+        # ── 跳转地图（本节每个调用落到哪，逐条列出）──────────────────────
+        #   self._init_boundaries()        → 本类 :3185，内部调 mhc.make_boundary
+        #   mhc.use_stats_stream(...)      → models/deepseek_v4_mhc.py :223
+        #   mhc.fork_stats_stream(...)     → deepseek_v4_mhc.py :395
+        #   mhc.combine(...)               → deepseek_v4_mhc.py :402
+        #                                     └─ _combine :419
+        #                                         └─ kernels/ops/layernorm/mhc.hc_combine
+        #   state.release()                → deepseek_v4_mhc.py :141（HcState.release）
+        #   self.self_attn(...)            → MQALayer.forward（_build_self_attn :3145
+        #                                     返回的就是 MQALayer）→ 再进 MQALayer 内部
+        #   self.self_attn.maybe_use_decode_attn_tp → MQALayer 的上下文管理器
+        #   mhc.run_attn_post(...)         → deepseek_v4_mhc.py :652
+        #                                     ├─ AttnOutput 分支 → kernels/ops/communication/
+        #                                     │   all_reduce_mhc_post_combine_norm
+        #                                     └─ 否则 → _post_fusion(...)
+        #   self._run_moe_ffn_dp_sync(...) → 本类 :3836（MoE 入口）
+        #   mhc.run_moe_post(...)          → deepseek_v4_mhc.py :686
+        #                                     ├─ deferred finalize 可融合 → 同一集合通信 kernel
+        #                                     └─ 否则 → _post_fusion(...)
+        #
+        # ── 首次进入时解析两个边界 ──────────────────────────────────────
         self._init_boundaries()
+        # 作用：把"本层 attn→ffn"和"本层 ffn→下一层 attn"这两个边界的
+        #      norm 与能力（能否把下一层的 norm 折进本次 post）解析出来。
+        #      ATTN[i]→MOE[i]  → local_boundary（post_attention_layernorm）
+        #      MOE[i]→ATTN[i+1]→ next_boundary （下一层的 input_layernorm）
+        #      延迟到首次 forward 才做：accepts_mxfp8 要等权重加载完成才定。
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
+            # 何时用独立流算 mixing 统计量（hc_pre 的 Sinkhorn 系数）：
+            # 大 batch 时把这段与主计算重叠；小 batch 反而更慢，所以有判据。
 
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
+            """第一个子层：combine(pre) → 注意力 → post（并预算下一子层的 pre）。"""
             assert self.attn_hc is not None
             residual = state.residual
+            # ↑ 先把残差取出来单独持有：combine 之后 state 会被 release，
+            #   但 post 阶段还要用这份残差。
             quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
+            # ↑ 若注意力吃 MXFP8 的"已打散"输入，combine 时可以顺手量化并
+            #   把 swizzled 版本塞进这个 list，省一次量化 kernel。
             mhc.fork_stats_stream(stats_stream)
+            # ↑ 把当前流切到 stats 流（或什么都不做）——必须与 combine 配对使用。
             x = mhc.combine(self.attn_hc, state, quantized)
+            # ↑ 【子层输入】= norm(Σ_k pre[k] * R[k])
+            #   入口处有短路：若上一次 post 已经留下了 state.input
+            #   （HcQuantized / HcNormed），直接复用，不再重算。
             state.release()
+            # ↑ 立刻清空 state.streams / pre / input：
+            #   残差已被局部变量 residual 别住，这里放手是为了不再"钉住"
+            #   那块显存（模型循环里还持有着 state 的旧引用）。
             del state
             world_size = self.self_attn.attn_tp_size
+
             fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
+            # ↑ 能否把"注意力输出的 all-reduce"与"mHC 的 post+combine+norm"
+            #   合成一个集合通信 kernel；行数太小/太大都不划算，
+            #   所以 can_fuse_all_reduce 还要看 (tokens, hidden) 的形状。
             with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                # ↑ 上下文管理器：decode 时临时换成另一套 TP 划分（attn_tp 与
+                #   tp 不同），退出即还原。
                 y = self.self_attn(
                     x=x,
                     positions=positions,
@@ -3786,6 +3832,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                     x_quant=quantized[0] if quantized else None,
                     defer_all_reduce=fuse_all_reduce_mhc,
                 )
+                # ↑ 【注意力本体】→ MQALayer.forward
+                #   defer_all_reduce=True 时它不自己 reduce，而是返回 AttnOutput
+                #   （带着未归约的 partial），让 post 的集合通信 kernel 一起做。
             del x
             return mhc.run_attn_post(
                 self.attn_hc,
@@ -3795,15 +3844,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                 next=self.local_boundary,
                 world_size=world_size,
             )
+            # ↑ 【注意力 post】返回新的 HcState：
+            #   · y 是 AttnOutput（融合路径）→ all_reduce_mhc_post_combine_norm
+            #     一次 kernel 里做 all-reduce + post 混合 + 下一个 pre 的 combine+norm
+            #   · 否则 → _post_fusion：算出新的 residual 与 pre，
+            #     并尝试把 local_boundary.norm 折进去（norm_fusable 为真时）
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
+            """第二个子层：combine(pre) → MoE → post（给下一层留 pre）。"""
             assert self.ffn_hc is not None
             residual = state.residual
             mhc.fork_stats_stream(stats_stream)
             x = mhc.combine(self.ffn_hc, state)
+            # ↑ 这里没有 quantized 参数：MoE 的入口量化在 _run_moe_ffn_dp_sync 里。
             state.release()
             del state
             nxt = self.next_boundary if seam_open else None
+            # ↑ seam_open=False 表示"本层之后晚层要收窄成尾段行"：
+            #   此时不要为下一层预算 pre —— 那些行马上就不存在了，
+            #   预算出来也是废的（而且会按错的行数分配缓冲）。
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
@@ -3814,6 +3873,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
                 return_moe_output=fuse_all_reduce_mhc,
             )
+            # ↑ 【MoE 本体】→ 本类 :3836 _run_moe_ffn_dp_sync
+            #   它内部按三种角色分流：
+            #     · 路由：gate（hash 路由时用 input_ids_global）
+            #     · 派发：deepep/megamoe 的 dispatch（或 TP-MoE 的 gather）
+            #     · 归约：reduce_results / all-reduce
+            #   return_moe_output=True 时返回 MoEOutput（可能带 deferred finalize），
+            #   把"最终化 + 共享专家相加 + all-reduce"留给 post 的融合 kernel。
             del x
             return mhc.run_moe_post(
                 self.ffn_hc,
@@ -3823,8 +3889,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                 next=nxt,
                 world_size=self.mlp.tp_size,
             )
+            # ↑ 【MoE post】两种走法：
+            #   · out 是 MoEOutput 且 is_deferred_finalize(out.routed) 且形状允许
+            #       → 走同一个集合通信 kernel（finalize + shared add + all-reduce，
+            #         若给了 next 还会顺手量化下一层的输入）
+            #   · 否则 → 自己 finalize，然后 _post_fusion
 
         return run_ffn_hc(run_attn_hc(state))
+        # ↑ 顺序固定：attn 子层 → ffn 子层。
+        #   两个子层各"折叠"一次 mHC：
+        #     combine(pre) 把 hc_mult 条流按上一层的 mixing 系数压成 1 条
+        #     post(…)      把子层输出加回 hc_mult 条流，并算出【下一个】pre
 
     # 【MoE 入口】本层后半段：MoE（或 dense MLP）+ 必要的 DP 同步。
     #   三个角色的分工：

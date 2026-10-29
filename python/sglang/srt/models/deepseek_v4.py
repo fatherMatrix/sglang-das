@@ -5079,6 +5079,23 @@ class DeepseekV4Model(nn.Module):
         #        PD 分离时由 D 侧决定（按请求存在 pd_hidden_state(req).capture_layer_ids，
         #        再由 get_pd_hidden_capture_layer_ids 汇总）。同一个 P 可能服务
         #        多个不同 draft 的 D，所以集合是【按批】的。
+        #
+        #      ★ "发给哪个 D、要哪几层"其实在【请求级】就定好了，不是组批时决定的：
+        #        时序：
+        #          a) router 选路 → D 侧发起 bootstrap，zmq 发 TransferInfo，
+        #             其中 spec_metadata["pd_hidden"] 携带 dspark_meta
+        #             （target_layer_ids / pp_slices / hidden_len /
+        #               streaming_hidden ...）
+        #          b) P 侧 mooncake 的 bootstrap_thread 收齐【全部 D rank】的
+        #             TransferInfo 后，把它存进 req_to_pd_hidden_meta[bootstrap_room]
+        #             （bootstrap_room 是请求级握手号）
+        #          c) P 侧调度：_finalize_pd_hidden_bootstrap 按【本 PP rank】
+        #             从 pp_slices 取出该 rank 负责的 local_layer_ids，
+        #             写进 pd_hidden_state(req).capture_layer_ids
+        #          d) 组批：get_pd_hidden_capture_layer_ids(batch.reqs) 把它
+        #             提升成【批级】，供本函数使用
+        #        注意 d) 只取"第一个非空"的值、不校验批内一致性 ——
+        #        依赖"同一 P 上的 D 使用同一份 draft 配置"这个部署前提。
         #   ② self.dspark_layers_to_capture
         #        非 PD 路径的模型级配置：来自 spec_aux_config.dflash_target_layer_ids，
         #        经 set_dspark_layers_to_capture 过滤成

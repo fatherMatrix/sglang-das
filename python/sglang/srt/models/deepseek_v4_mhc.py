@@ -61,9 +61,20 @@ the kernel dispatch.
 
     ⑤ 传给下一个子层：(R_{k+1}, pre_k)
 
-  ★ 这个错位（pre_k 由 R_k 算出、却作用在 R_{k+1} 上）就是 single-pass mHC：
-    好处是 ① 能在 ③ 还没算完时就开始（stats 流），无需等子层输出；
-    副作用见下面"为什么 post+pre 不可表达"。
+  ★ 这个错位（pre_k 由 R_k 算出、却作用在 R_{k+1} 上）就是 single-pass mHC。
+    它带来的收益只有一条，但很关键：② 不再依赖【本层】的 ①。
+      没有错位（V4 Pro）：② 必须先拿到 pre_k，① 卡在关键路径上，
+                         形状是 ①(R_k) → ② → ③，无法重叠。
+      有错位（V4.1）    ：② 只用上层留下的 pre_{k-1}，于是 ① 可以被推迟发行，
+                         形状是 ②③ 走主流、① 走 stats 流，两者并行。
+    实现手法（见 fork_stats_stream / _compute_triplet）：
+      · fork 点在 combine【之前】：stats_stream.wait_stream(main)
+        —— 侧流只需要"combine 之前那一刻的残差"，不需要子层结果；
+      · 发行点在 post（子层之后）：把 kernel 排进侧流队列，
+        GPU 侧与主流上仍在执行的子层 kernel 并行；
+      · join 点在 post 读 triplet 之前：current_stream.wait_stream(stats_stream)。
+      即"依赖早、发行晚"——所以能重叠。
+    代码证据：use_stats_stream 第一句就是 `if not cfg.pre_from_prev: return False`。
 
   ★ Sinkhorn 为什么必须做（comb 的约束）：
       先 exp(· - 行max) 做行归一，再列归一，交替 I 次 → 近似双随机矩阵。

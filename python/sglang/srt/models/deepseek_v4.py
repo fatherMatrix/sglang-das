@@ -5026,6 +5026,33 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
+        # 【NPU 专属：把注意力元数据切成"本 rank 视角"】
+        #   ★ HCU / CUDA 上整段跳过（_is_npu 为 False），只有 get_attn_backend() 一次取用。
+        #
+        #   为什么 NPU 需要单独一步：NPU 走 legacy prefill CP 时，attention 的
+        #   Ascend 后端读的是【每 batch 一张表】（block_tables / swa_page_table /
+        #   kernel_metadata），而 CP 切分后本 rank 只该看自己那部分行，
+        #   所以要在进层循环之前把这些表按本 rank 的行集合重选一遍。
+        #
+        #   prepare_dsv4_cp_metadata 内部做的事（幂等，prepared 标志防重入）：
+        #     ① local_idx = strategy.local_q_indices(...)  本 rank 的行号
+        #        裁到 shard_bound（= attn_cp_metadata.total_seq_lens，
+        #        与 runner 切模型输入用的是同一个上界）
+        #     ② local_positions = global_positions[local_idx]
+        #        再用 pad_local_rows 补到 per_rank_actual_token（pad 行位置填 0）
+        #     ③ local_batch_ids = batch_ids[local_idx]（每行属于哪个请求，pad 填 0）
+        #     ④ 按 local_batch_ids 重选 block_tables / swa_page_table / c4/c128 表
+        #     ⑤ 重建 kernel 元数据：actual_seq_lengths_q / q_pa / kv、max_seqlen_q=1
+        #        其中 seqused_kv = local_positions+1（有效行）、1（pad 行）
+        #     ⑥ 把原来的整批字段存进 dsv4_cp_full_fields，
+        #        供 use_dsv4_cp_full_metadata 临时切回（共享专家等需要全量表的地方）
+        #     ⑦ 记下 dsv4_cp_global_positions / dsv4_cp_local_positions / prepared
+        #
+        #   下面这段 if 只做一件事：把 batch 级的 positions 同步成本 rank 的局部版本。
+        #     守卫 conditions 是"长度必须相等"——只有调用方传进来的 positions
+        #     已经是本 rank 的行集合时才覆盖；若 lengths 不同（legacy 路径下
+        #     positions 此刻仍是整批），就不动它，交给块 ② 的
+        #     cp_split_and_rebuild_position 统一切分。
         attn_backend = get_attn_backend()
         if _is_npu and forward_batch.attn_cp_metadata is not None:
             attn_backend.prepare_dsv4_cp_metadata(forward_batch)

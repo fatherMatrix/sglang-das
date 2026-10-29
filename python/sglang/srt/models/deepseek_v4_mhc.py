@@ -199,8 +199,36 @@ def is_deferred_finalize(routed) -> bool:
 
 
 def make_boundary(norm: RMSNorm, *, accepts_mxfp8: bool) -> HcNextBoundary:
-    """Can this hyper-connection's norm fold into the previous post, and does its
-    sublayer take a pre-quantized input."""
+    """构造"接缝能力描述符"：告诉上一个 post，它能在多大程度上顺手把下一层也做了。
+
+    ★ 解决什么问题
+      两个子层之间的接缝上，本来要串行做：post 写回残差 → 下一个子层 combine
+      （加权求和）+ norm +（可选）量化。这些都能合进 post 的那个 kernel，
+      但**不是总成立** —— 取决于下一层 norm 的形态、以及它的第一个投影
+      能不能吃"已打散"的 MXFP8 输入。把判断结果一次性算好、存成三个字段，
+      上游 post 就不用每层每批重新判断。
+
+    ★ 三个字段各管一段融合
+      norm         下一个子层的 RMSNorm 对象 —— 上游要它的 weight 与
+                   variance_epsilon 才能把 norm 折进自己的 kernel。
+      norm_fusable 这个 norm 能不能折（见下面五项检查）。False 时 post 只做
+                   自己那步，下一个 combine 自己去算 norm。
+      accepts_mxfp8 下一个子层是否接受 HcQuantized（normed + swizzled）。
+                   True 时 post 的 kernel 连"量化+打散"一起做，
+                   返回 HcQuantized，下一个 combine 直接拿去喂第一个 GEMM；
+                   False 时只返回到 HcNormed 为止。
+
+    ★ 为什么 norm_fusable 要查这五项（每一项都对应一个 kernel 内联不了的形态）
+        cast_x_before_out_mul   要在 out_mul 之前 cast，融合 kernel 里没这条路径
+        variance_size_override  方差维度被改写，kernel 只支持标准 (…, 5120)
+        weight.dtype == bf16    融合 kernel 的 ABI 是 bf16
+        shape == (5120,)        当前实现只做了这个宽度（见 TODO）
+        is_contiguous           要按连续地址读 weight
+
+    ★ 何时调用（两次时机都很关键）
+      构造后首次 forward 的 _init_boundaries 里：因为 accepts_mxfp8 依赖
+      process_weights_after_loading 的结果（量化转换会改变"能否吃打散输入"）。
+    """
     return HcNextBoundary(
         norm=norm,
         accepts_mxfp8=accepts_mxfp8,

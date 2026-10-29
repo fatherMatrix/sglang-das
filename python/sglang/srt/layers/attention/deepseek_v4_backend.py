@@ -2491,7 +2491,8 @@ class DeepseekV4AttnBackend(
 
           每行（长度 = Σ尾长，按请求分组、组内保原序）：
             token_indices       尾行在【原 extend】里的行号
-            positions           这些行的绝对位置
+            positions           这些行的【绝对位置】—— 0-based，含历史 prefix，
+                                即"该 token 在整个序列里排第几"，不是 0..尾长-1
             swa_replay_start    每行 SWA 窗口下界（floor）
             out_cache_loc       尾行的 KV 写入位置
             low_ratio_req_indices / low_ratio_pos_i64

@@ -500,7 +500,61 @@ class NgramEmbeddingInfo:
 
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
-    """Store all inputs of a forward pass."""
+    """Store all inputs of a forward pass.
+
+    ==================================================================
+    三种粒度（读任何字段前先确认它属于哪一种，这是最容易读错的地方）
+    ==================================================================
+      batch 级：一个标量 / 一个对象，整批一个
+          forward_mode / batch_size / attn_cp_metadata / encoder_swa_replay
+      请求级  ：长度 = bs，一个请求一个数
+          seq_lens / seq_lens_cpu / extend_seq_lens / extend_start_loc / req_pool_indices
+      token 级：长度 = T（本次 forward 的行数）
+          ★ prefill 时 T = Σ extend_seq_lens；decode 时 T = bs（每请求 1 个 token）
+          input_ids / positions / out_cache_loc
+
+    ==================================================================
+    关键通用字段
+    ==================================================================
+      forward_mode        这批算什么：extend / decode / idle / target_verify / draft_extend
+                          绝大多数分支的第一个判据（is_extend() / is_decode()）
+      batch_size          请求数，也是所有"请求级"张量的长度
+      input_ids           (T,) 本次要算的 token id（可能已按 CP/DP 切过）
+      req_pool_indices    (bs,) 每请求在 req_to_token_pool 里的槽位
+                          → req_to_token[req_pool_indices[r], pos] 给出"位置 → KV slot"
+      seq_lens            (bs,) 每请求的【总长】（含历史）；prefill 时 = prefix + extend
+      seq_lens_cpu        seq_lens 的 CPU 镜像（避免 device→host 同步，构造元数据要用）
+      extend_seq_lens     (bs,) 每请求本次新增多少 token（chunked prefill 下 < 总长）
+      extend_start_loc    (bs,) 每请求的行起点（cumsum(extend) - extend）
+                          → 第 r 个请求占 [start[r], start[r] + len[r]) 这些行
+      extend_seq_lens_cpu 同上，CPU list
+      positions           (T,) 每行绝对位置（RoPE 用），见下面公式
+      out_cache_loc       (T,) 每行 KV 写到哪个 slot —— ★ 写侧，不是读侧
+                          CP 下保持全局顺序（压缩器要按全局顺序整段写）
+      attn_cp_metadata    本批的 CP 切分信息；legacy round-robin 时是【空对象】
+                          （归属规则 t % cp_size 自带，不需要切分表）
+
+    ==================================================================
+    四组容易混的关系（都能在代码里对上）
+    ==================================================================
+      ① extend 三件套
+             extend_num_tokens = Σ extend_seq_lens      （= T）
+             第 r 个请求的行区间 = [extend_start_loc[r], extend_start_loc[r] + extend_seq_lens[r])
+
+      ② prefix_len = seq_lens - extend_seq_lens
+             radix 命中的部分；chunked prefill 时它就是"之前已经算过的长度"
+
+      ③ positions 的精确公式（compute_position_torch）
+             positions[i] = prefix_len[r] + (i - extend_start_loc[r])
+             其中 r 是第 i 行所属的请求。所以同一请求的行位置是连续递增的区间，
+             起于 prefix_len（而不是 0）。
+
+      ④ out_cache_loc vs page_table（一个写、一个读）
+             out_cache_loc   每行一个 slot       "我把 KV 写到哪"
+             page_table      每行一串页号       "我读 KV 要去哪些页"（在 core 元数据里）
+             前者在 ForwardBatch，后者在 AttnBackend 的元数据 —— 分属两个对象
+    ==================================================================
+    """
 
     # === Required core inputs (no default; input_ids / req_pool_indices / seq_lens / out_cache_loc are borrowed from ScheduleBatch) ===
     # The forward mode

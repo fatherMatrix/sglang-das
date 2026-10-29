@@ -2742,11 +2742,33 @@ class DeepseekV4AttnBackend(
             contiguous_start=contiguous_start,
         )
         metadata.low_ratio_pos_i64 = positions.to(torch.int64)
-        # 两种尾段形态：
-        #   非 CP：token_indices 直接索引本 rank 的整批 extend（行号即 extend 行号）
-        #   CP  ：token_indices 换成【本 rank 的局部行号】，并带 pad_rows / cp_metadata，
-        #         同时保留 global_token_indices / req_global / pos_global
-        #         （DSpark 注入与压缩器需要全局行号，不能用局部行号）
+        # 两种尾段形态。**核心只差一件事：token_indices 用哪套坐标系**，
+        # 其余差异都是这件事的连带结果（下表 A = 非 CP，B = CP）。
+        #
+        #   字段                  A 非 CP                      B CP
+        #   ─────────────────────────────────────────────────────────────────────
+        #   token_indices        整批 extend 行号             本 rank 的【局部】行号
+        #                        (Σ尾长,) 例 72..236         (counts[cp_rank],) 例 9..29
+        #                        用来切本 rank 的 hidden      同为切 hidden，但行集已变
+        #   positions            绝对位置                    本 rank 行位置，
+        #                        (Σ尾长,)                    (max_local,) 【补 0 到 max_local】
+        #   contiguous_start     bs==1 时有值（切片快路径）  恒 None（行 [r,r+8,…] 不连续）
+        #   pad_rows             0                           max_local - counts[cp_rank]
+        #   cp_metadata          None                        InterleaveContextParallelMetadata
+        #   local_lens(_cpu)     None                        本 rank 每请求尾行数
+        #   req_global/pos_global None                       全局行级请求号/位置（压缩器用）
+        #   global_token_indices None                        整批 extend 行号（DSpark 注入用）
+        #   ─────────────────────────────────────────────────────────────────────
+        #   两边相同的：extend_seq_lens(_cpu)（每请求尾长，全局语义不变）。
+        #
+        # ★ 为什么 B 要保留 global_*：晚层真正"算"用局部行号，但两处下游需要全局视角：
+        #     · 压缩器按【全局 token 顺序】写压缩状态 → req_global / pos_global
+        #     · DSpark 注入按【全局 extend 索引】取行 → global_token_indices
+        #   用局部行号会写到别的请求的位置上。
+        #
+        # ★ 为什么 A 的 positions 不补零而 B 要补：A 的行数就是真实行数（Σ尾长），
+        #   没有 pad；B 的行数被补齐到 max_local（集合通信要等长），
+        #   pad 行的位置只能填 0（不会被任何 query 读到）。
         if cp_tail is None:
             # Without CP, tail rows index the full extend on this rank.
             metadata.late_layer_tail = LateLayerTail(

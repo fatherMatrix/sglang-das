@@ -18,6 +18,67 @@ The layer owns parameters, parallelism and token-range policy; this module owns
 the kernel dispatch.
 
 ======================================================================
+符号表（后面所有公式都用这些名字）
+======================================================================
+  T              本批 token 行数
+  d / hidden     5120
+  n / hc_mult    残差流的条数 = 4
+  R              [T, n, d]   残差：每 token n 条并行流
+  H  (fn)        [n(2+n), n·d] = [24, 20480]   mixing 矩阵（fp32）
+  s  (scale)     [3]          三段输出各自的缩放
+  b  (base)      [n(2+n)] = [24]              三段输出各自的偏置
+  m              scalar       post 的倍数（hc_post_mult_value）
+  ε_pre          标量         pre 的下限（+eps，避免 0 把流彻底掐死）
+  ε_rms / ε_sink 标量         数值保护
+  I              20           Sinkhorn 迭代次数
+
+  pre            [T, n]       压流系数：子层输入取哪几条流、各占多少
+  post           [T, n]       写回系数：子层输出按比例加进每条流
+  comb           [T, n, n]    流间混合矩阵：残差自身如何重组
+  y              [T, d]       子层输出（attn 或 MoE）
+
+======================================================================
+一层的精确数据流（注意 pre 与 R 的"错位一个 block"）
+======================================================================
+  进来时 state 带着两样：(R_k, pre_{k-1})
+
+    ① mix stats（在 R_k 上算，可与子层并行）
+         x_flat = R_k.flatten(1)                          [T, n·d]
+         rms    = 1/sqrt(mean(x_flat²) + ε_rms)            ← 均值跨 n·d 求
+         M      = (x_flat @ Hᵀ) · rms                      [T, 24]
+         pre_k  = σ(M[:, 0:n]·s0 + b0) + ε_pre             [T, n]
+         post_k = 2σ(M[:, n:2n]·s1 + b1) · m               [T, n]
+         comb_k = Sinkhorn(M[:, 2n:].view(T,n,n)·s2 + b2, I)  [T, n, n]
+
+    ② combine（用的是【上一个】子层算出的 pre_{k-1}，不是 pre_k）
+         x_k = norm( Σ_h pre_{k-1}[h] · R_k[h] )           [T, d]
+
+    ③ 子层
+         y_k = f_k(x_k)                                    [T, d]
+
+    ④ post（用 ① 刚算出的 post_k / comb_k）
+         R_{k+1}[i] = post_k[i]·y_k + Σ_j comb_k[i][j]·R_k[j]     [T, n, d]
+
+    ⑤ 传给下一个子层：(R_{k+1}, pre_k)
+
+  ★ 这个错位（pre_k 由 R_k 算出、却作用在 R_{k+1} 上）就是 single-pass mHC：
+    好处是 ① 能在 ③ 还没算完时就开始（stats 流），无需等子层输出；
+    副作用见下面"为什么 post+pre 不可表达"。
+
+  ★ Sinkhorn 为什么必须做（comb 的约束）：
+      先 exp(· - 行max) 做行归一，再列归一，交替 I 次 → 近似双随机矩阵。
+      它保证各流的总质量守恒：没有这个约束时，40 层连乘会让某些流被指数级
+      放大、另一些被压到 0（mixing 矩阵的谱半径失控）。
+
+  ★ 为什么"post + 下一层 combine + norm"能融合、而"post + 下一层 pre"不能：
+      · 能：post 写完 R_{k+1} 之后，下一层的 combine 只需要
+            norm(Σ pre_k·R_{k+1}) —— pre_k 此刻已经知道，R_{k+1} 就在手里，
+            于是"写 R + 压流 + norm"可以一次做完（HcNormed / mhc_post_combine_norm_prefill）。
+      · 不能：pre_{k+1} 要用 R_{k+1} 做一次 24×20480 的 GEMM + Sinkhorn，
+            那是下一轮 mix stats 的活；硬塞进 post 的 kernel 里既拿不到
+            H 的分块，也破坏了"① 与 ③ 并行"这个设计前提。
+
+======================================================================
 四步各自的融合清单（V4.1 到底有哪些融合，按生效范围排）
 ======================================================================
   ① mix stats（步骤 1）—— H·R + RMS + Sinkhorn(20 轮) + 门控 → (pre, post, comb)

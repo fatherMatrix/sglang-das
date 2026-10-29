@@ -4943,14 +4943,34 @@ class DeepseekV4Model(nn.Module):
         #           if moe.is_hash else {}）
         #     · 层内 MoE（仅当 attn_dp>1 且无 A2A，见 _run_moe_ffn_dp_sync 的
         #       _use_tp_moe_gather）：
-        #         attention 只算【本 rank 的请求】→ hidden 只有 M_local 行；
-        #         但 MoE 必须看到【全局】token 才能产出每个 token 的专家分片，
-        #         所以那里先 dp_gather_replicate 成 M_global 行：
-        #             第 r 个 rank 的 local 行 → 全局 buffer 的 [start_r, start_r+M_local)
-        #         路由（尤其 hash 路由）是【按行查 id】：global_ids[i] 必须是
-        #         第 i 个槽位那个 token 的 id。
-        #         可手里只有 M_local 个 id —— 不拼成同一套槽位，第 i 行就查到
-        #         别的 token 的 id（或越界）。这就是"槽位 → id 一一对应"的含义。
+        #         attention 只算【本 rank 的请求】→ hidden 只有 M_local 行。
+        #         但 TP-MoE 的专家是【按专家号分片】的：rank r 只持有
+        #         1/tp 的专家（如 256 个专家里 32 个），而 gate 是复制的，
+        #         每个 rank 都能算出"某 token 该用哪 k 个专家"。
+        #         关键：rank r 要算的是【自己那 32 个专家】对【每一个 token】的贡献
+        #         —— 因为任何 token 都可能 route 到它的专家（路由依赖数据，事先
+        #         无法知道哪些 token 会用到谁）。要算 e(h_t) 就必须有 h_t，
+        #         所以 rank r 需要【所有 token】的 hidden：
+        #             dp_gather_replicate 一下，从 M_local 行拼成 M_global 行，
+        #             第 r 个 rank 的 local 行落在全局 buffer 的
+        #             [start_r, start_r + M_local) 这些槽位上。
+        #         最后每个 token 的输出 = 各 rank 算出的 partial 之和
+        #         （deepseek_v2.MoE → post_experts_all_reduce，SUM 归约）。
+        #
+        #         于是路由是【按行查 id】：global_ids[i] 必须是第 i 个槽位那个
+        #         token 的 id。手里只有 M_local 个 id，不拼成同一套槽位，
+        #         第 i 行就查到别的 token 的 id（或越界）——这就是"槽位 → id
+        #         一一对应"的含义。
+        #
+        #     ★ 对照：有 A2A（deepep / megamoe）时反过来 ——
+        #         不复制 token，而是把 token 搬到专家那里（dispatch）：
+        #           每个 token 按 top-k 被发到"拥有它选中专家"的 rank，
+        #           算完再 combine 回原 rank 累加。
+        #         于是 rank r 只处理"选中了它的专家"的那部分 token
+        #         （期望 ≈ M_global × k / tp 行），而不是全部 M_global 行；
+        #         路由在 dispatch 之前就在本地 token 上算完，所以
+        #         本地 input_ids 就够，不需要全局 id 表 —— 这就是本块
+        #         第二个条件 get_moe_a2a_backend().is_none() 的来源。
         #   若某 rank 只握有局部 id，槽位号与 id 就对不上，路由会取到别的 token。
         #
         # 【为什么只在 attn_dp>1 且没有 A2A 时才做】

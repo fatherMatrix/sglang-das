@@ -3195,27 +3195,63 @@ class DeepseekV4AttnBackend(
              LayerSplit 池 reset_batch_active_pages()
                 （整批的选页缓存是按整批行算的，尾段读别的行，必须作废）
         =================================================================="""
+        # ── ① 拿到"要切过去的那一份元数据" ─────────────────────────────
+        #   AttnBackend 上挂着两个 DSV4Metadata 实例：
+        #     self.forward_metadata      ← 整批（本函数要把它换掉）
+        #     self.tail_forward_metadata ← 尾段（就是这一个）
+        #   尾段版由 init_forward_metadata 建；CP 真切时块 B 的
+        #   convert_late_layer_tail_to_hcu_cp 又用 rank-local 行重建过一次。
         tail_metadata = self.tail_forward_metadata
+        # 能走到这里它必然存在（块 4 进 else 的条件与"造它"的条件镜像），
+        # 这行断言只是防止以后有人改了条件却忘了这里。
         assert tail_metadata is not None, "no tail metadata for this forward"
+
+        # ── ② 存现场：下面有三处全局状态会被改，原样留下给 exit 还原 ───────
+        #     [0] self.forward_metadata  ← 第 ④ 步会换成 tail_metadata
+        #     [1] attn_cp_metadata       ← CP 分支会换成尾段那套
+        #     [2] local_dp_buffer_len    ← 同上（DP gather 缓冲的行数）
+        #   三者分属不同对象（后端属性 / batch 字段 / 模块级单例），
+        #   所以才需要一个元组把它们一起带出来。
         saved = (
             self.forward_metadata,
             forward_batch.attn_cp_metadata,
             get_local_dp_buffer_len(),
         )
+
+        # ── ③ 取出"行描述"（LateLayerTail），后面两步都要用它 ─────────────
+        #   注意：这里只是取它的一个字段，整份元数据要到第 ④ 步才换上。
         tail = tail_metadata.late_layer_tail
+        # 每请求的行数（下面裁 candidate 时"每请求末尾取 t 行"要用）：
+        #   CP  ：local_lens_cpu     本 rank 在每个请求上分到几行
+        #                            Σ = counts[cp_rank]（不含空白行）
+        #   非CP：extend_seq_lens_cpu 该请求的尾长 min(128, extend_len)
+        # 判据用 cp_metadata 是否为 None —— 它只在 CP 布局里才被填。
         tail_lens_cpu = (
             tail.local_lens_cpu
             if tail.cp_metadata is not None
             else tail.extend_seq_lens_cpu
         )
+        # ── ④ 桥接 candidate_metadata（候选块）────────────────────────────
         # TODO(candidate): goes away once the source publishes its tail rows straight
         # onto the tail metadata (publish_prefill); until then cut the full masks.
+        #
+        # 它是什么：L20 那个"候选源层"发布的【候选块集合】，
+        #   request_masks      List[Tensor]  第 b 个请求一个 [rows_b, 候选列] bool 掩码
+        #   request_block_ids  List[Tensor]  第 b 个请求一个 [rows_b, K] 块号
+        # 谁写的：候选源层（candidate_source_layer_id=20）在 publish_prefill 里发布。
+        # 谁读的：后面那些 uses_candidates 的索引层（24/28/32/36），只在池子里搜。
+        #
+        # 为什么这里要"裁"：早层按【整批行】发布（rows_b 是该请求的完整 extend），
+        # 而晚层只有最后 t 行 —— 所以每个请求取【末尾 t 行】。
+        #   mask[mask.shape[0] - t :] 就是"从倒数第 t 行取到结尾"。
+        # 裁出来的是【新 list + 新张量视图】，尾段元数据不共享早层的对象。
         full_masks = self.forward_metadata.candidate_metadata
         if isinstance(full_masks, CandidateMasks) and (
             full_masks.request_masks is not None
             or full_masks.request_block_ids is not None
         ):
             tail_metadata.candidate_metadata = CandidateMasks(
+                # 只有真的提供了 masks 才处理，否则保持 None（两端都判 None）
                 request_masks=(
                     [
                         mask[mask.shape[0] - t :]
@@ -3235,49 +3271,99 @@ class DeepseekV4AttnBackend(
                     else None
                 ),
             )
+        # ── ⑤ 桥接 sparse top-k 三件套（逐行搬运）─────────────────────────
         # The layers before the switch published top-k into the full metadata's
         # buffers; carry the tail rows into the tail metadata's (padding stays -1).
+        #
+        # 为什么必须搬：晚层里 21/22/23、25/26/27… 这些 Reuse 层【没有 indexer】
+        #   （连模块都没建），它们只能读"最近一个索引层算好的" top-k；
+        #   而那份结果此刻躺在【整批】元数据的 buffer 里（行数 = Σ尾长 之外的全量）。
+        #   不搬的话晚层会按"别的行"的选择去读压缩 KV，页号全错。
+        #
+        # 两个 core 的区别就是"行集合"：
+        #   full_core ← saved[0]，整批（N 行）      ┐ 同一个 ratio 一份 buffer，
+        #   tail_core ← tail_metadata，尾段（t 行）  ┘ 只有行数不同
         full_core = saved[0].core_attn_metadata
         tail_core = tail_metadata.core_attn_metadata
+        # 按压缩比家族遍历（V4.1 是 {1,2}；V4 Pro 是 {4,128}）
         for ratio in tail_core.low_ratios:
+            # 三件套逐个搬，语义见下：page_indices / topk_lengths / raw_indices
             for full_buf, tail_buf in (
                 (
+                    # 选中的物理页号：(行, index_topk) int32
                     full_core.sparse_page_indices(ratio),
                     tail_core.sparse_page_indices(ratio),
                 ),
                 (
+                    # 每行实际有效长度（不足处为 -1）：(行,) int32
                     full_core.sparse_topk_lengths(ratio),
                     tail_core.sparse_topk_lengths(ratio),
                 ),
                 (
+                    # 选中的逻辑下标（请求内压缩位置），workspace 重建用：
+                    # (行, index_topk) int32；仅 prefill 有
                     full_core.sparse_raw_indices(ratio),
                     tail_core.sparse_raw_indices(ratio),
                 ),
             ):
+                # 任一端为 None 就跳过：某家族可能只有其中几种（例如 decode 没有 raw）
                 if full_buf is None or tail_buf is None:
                     continue
+                # real_rows：按【尾段行号】从整批 buffer 里取行
+                #   （CP 下会自动用 global/局部行号换算，见 LateLayerTail.real_rows）
                 rows = tail.real_rows(full_buf)
+                # 拷到尾部 buffer 的前 rows 行；后面的位置【保持初始 -1】
+                #   -1 = 无效哨兵，kernel 遇到就跳过，所以不需要清零
                 tail_buf[: rows.shape[0]].copy_(rows)
+        # ── ⑥ 换指针：从这一刻起，所有 self.forward_metadata 的读者看到的
+        #        都是尾段那份（行数 = 尾行数）。这是"切换"的实质动作。
         self.forward_metadata = tail_metadata
+        # ── ⑦ encoder SWA replay 的环形缓冲：换布局（不是还原型状态）──────
+        #   request_window 模式把每请求的 SWA 做成固定 ring，
+        #   write_loc 的有效性依赖"当前生效的是哪个 layout"，所以必须 activate。
+        #   非 encoder replay 时它是 None，跳过。
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
                 tail_core.request_window_layout
             )
+        # ── ⑧ CP：换成本 rank 尾段的切分信息 ─────────────────────────────
+        #   attn_cp_metadata 决定 all-gather 的形状与 gather_index，
+        #   尾段各 rank 行数不同（还有私有空白行），必须用自己那份。
+        #   local_dp_buffer_len 跟着换成"Σ per_rank_actual_token"（= cp_size×max_local），
+        #   因为 dp_gather / _mask_dp_pad_topk_ids 都按它算缓冲尺寸。
         if tail.cp_metadata is not None:
             forward_batch.attn_cp_metadata = tail.cp_metadata
             set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
+        # ── ⑨ LayerSplit：作废本批选页缓存 ──────────────────────────────
+        # The LayerSplit read pages are cached per batch from the full extend's
+        # indices; the tail reads other rows, so pick them again.
+        #   第 1 轮选页（active_pages_for_indices）的结果按【整批行】缓存，
+        #   尾段读的是另外的行 → 缓存直接失效，下次 prefetch 会重算。
         if is_cp_cache_layer_split_deepseek_v4_pool(self.token_to_kv_pool):
-            # The LayerSplit read pages are cached per batch from the full extend's
-            # indices; the tail reads other rows, so pick them again.
             self.token_to_kv_pool.reset_batch_active_pages()
+        # ── ⑩ 把现场交给调用方，退出时由 exit_late_layer_tail 还原 ①②────
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
+        """把 enter_late_layer_tail 改掉的三样状态换回去（尾段算完之后）。
+
+        注意"只还原三样"不是漏了：
+          · forward_metadata / attn_cp_metadata / local_dp_buffer_len
+              → 必须还原（整批视图要继续用于 logits 与后续批）
+          · request_window 的 layout、LayerSplit 的选页缓存
+              → 【不需要还原】：它们不是"上次的值更好"，而是每次进入时重新
+                activate / reset 一次即可，还原反而会有陈旧值风险。
+        """
+        # 解包顺序必须与 enter 里组包顺序一致：
+        #   [0] self.forward_metadata  ← 换回整批那份
+        #   [1] forward_batch.attn_cp_metadata ← 换回整批的 CP 布局
+        #   [2] local_dp_buffer_len    ← 换回整批的行数上界
         (
             self.forward_metadata,
             forward_batch.attn_cp_metadata,
             local_dp_buffer_len,
         ) = saved
+        # 标量是模块级单例，不在 batch / 后端对象里，所以要单独 set 一次
         set_local_dp_buffer_len(local_dp_buffer_len)
 
     def init_forward_metadata_target_verify(

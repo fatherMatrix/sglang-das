@@ -1138,11 +1138,38 @@ class Engram(nn.Module):
         #   所以两者不是"二选一"：先 Engram.forward，再由它内部调
         #   EngramEmbedding.forward（查表），最后调 engram_gate（门控）。
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+        # ① 查表结果 emb: [T, n_hash_cols, head_dim]
+        #      n_hash_cols = (max_ngram_size - 1) * n_heads
+        #                    （每个 n-gram 阶数 × 每阶的 head 数，见 EngramLayout）
+        #      head_dim    = layout.head_dim —— 注意这是【表行宽】，
+        #                    与下面的 hidden_size 不是同一个 dim，别混。
         if x.shape[0] == 0:
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.
+            # ↑ 空批（DP-attention 的空 rank / 全 pad 批）直接返回：
+            #   · MXFP8 量化 kernel 不接受 M=0；
+            #   · 但【查表已经在上面做了】—— DP 下它是集合通信，空 rank 也必须参与，
+            #     否则其他 rank 卡在 all_gather / all_reduce 上。
             return x
         kv, _ = self.wkv(emb.flatten(-2))
+        # ② kv 是【Engram 自己模块内的线性层】算出来的，和 attention 的 KV 无关：
+        #      self.wkv = ReplicatedLinear(
+        #          n_hash_cols * layout.head_dim,      ← 输入维（= 摊平后的记忆特征）
+        #          dim * (hc_mult + 1),                ← 输出维：hc_mult 个 key + 1 个 value
+        #          bias=False, ...)                    ← dim 是 config.hidden_size
+        #      emb.flatten(-2): [T, n_hash_cols, head_dim] → [T, n_hash_cols*head_dim]
+        #      kv            : [T, (hc_mult + 1) * dim]
+        #    用 ReplicatedLinear 是因为输入 emb 每个 rank 都持有完整副本
+        #    （shared 布局查表后人人一样），权重无需切分、也就无需通信。
+        #    ★ kv 用完即弃，不写进任何 KV 池、不跨层保存 —— 它不是缓存，
+        #      只是这一步门控的中间量。
         return engram_gate(
             x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
         )
+        # ③ 门控加回：x + gate ⊙ value
+        #      q_weight / k_weight: [hc_mult, dim]，从 checkpoint 加载的常量
+        #        （requires_grad=False；推理期不会被更新），
+        #        乘起来当逐维权重 w；真正决定 gate 的是 x 与 key 的相似度。
+        #      eps / clamp_value：两个 RMS 归一化与 sqrt(|dot|) 的数值保护。
+        #    内部按平台二选一：fused_engram_gate（Triton）或 torch 回退，
+        #    数学完全一致（见 engram_gate 与本文件末尾两个实现）。

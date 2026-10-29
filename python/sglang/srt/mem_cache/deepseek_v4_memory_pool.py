@@ -1119,8 +1119,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
       │   定位方式：compressed_slot = full_slot // ratio
       │   （DSV4AttnMetadata 的注释原话："one latent per ratio tokens, at slot
       │     raw_out_loc // ratio of the c1 / c2 pool"）
-      │   indexer 池类似，尺寸 (full_size + page_size) // ratio（多留一个
-      │   index padding page，因为保留了 FULL page 0）
+      │
+      │   indexer 池：尺寸是 (full_size + page_size) // ratio，不是 full_size//ratio
+      │     为什么多出一个 page_size：
+      │       · FULL 页 0 被保留（slot 0 是 padded token 的 dummy 写入目标，
+      │         永不分配）；分配器 clear() 里 free_pages = arange(1, num_pages+1)，
+      │         所以真实 slot ∈ [page_size, full_size + page_size)，
+      │         上界已经越过 full_size 一个页
+      │       · 折算成压缩槽位就是 (full_size + page_size) // ratio 个
+      │       · 而 indexer 自己的页只有 DSV41_INDEX_PAGE_SIZE 个槽（64，或 128），
+      │         比"一个 FULL 页折算出的 page_size//ratio 个压缩槽"更小
+      │         （ps=256,ratio=2 → 128 个压缩槽 = 2 个 64 槽 index 页），
+      │         所以当年"补一个 index padding page"的做法不够，改成了按上界算
+      │       例：ps=256, ratio=2 → 压缩槽位 = full/2 + 128，比 full/2 多 128 个
       │
       └─ SWA 池            0 .. swa_size-1
           定位方式：swa_slot = full_to_swa_index_mapping[full_slot]

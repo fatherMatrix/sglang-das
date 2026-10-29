@@ -939,11 +939,20 @@ class EngramEmbedding(nn.Module):
                 return self._empty(indices)
             out = self._empty(indices)
             engram_gather(
+                # ① 两个【裸地址】(int)：weight 表首地址、scale 表首地址。
+                #    之所以传 int 而不是张量：表可能在 device，也可能在 host
+                #    （HCU 默认 host + HSA 映射），kernel 里统一 to(pointer_type)
+                #    直接解引用，不需要区分。
                 *self._table_ptrs(),
+                # ② 要查的行号，摊平成 [N]（N = T × n_cols）
                 indices.reshape(-1),
+                # ③ 输出 [N, dim] bf16，与 ids 一一对应
                 out.view(-1, self.dim),
+                # ④ 每行宽度（编译期常量 DIM）
                 self.dim,
+                # ⑤ 每 64 个元素共用 1 字节 e8m0 scale
                 FP8_BLOCK_SIZE,
+                # ⑥ 本 rank 拥有的行区间 [0, rows)；越界的 id 直接出零行
                 row_hi=self.weight.shape[0],
             )
             return out

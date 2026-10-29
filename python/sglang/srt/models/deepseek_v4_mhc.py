@@ -157,8 +157,16 @@ the kernel dispatch.
                （mhc_boundary_hip.py；条件 _use_hcu_hc_mix_stats =
                  is_hcu and SGLANG_USE_LIGHTOP and SGLANG_HCU_HC_MIX_STATS_OPT，
                  且权重已 split 成 tf32/bf16 两半，shape (24, 20480)）
-       ★ 另有 stats_stream：把步骤 1 放独立流与 2~3 重叠（use_stats_stream；
-         decode-like 且非 sm90 时启用 —— HCU 命中）
+       ★ 另有 stats_stream：把步骤 1 放独立流与 2~3 重叠（use_stats_stream）。
+         ★ 但侧流本身只在 CUDA 且 blackwell/sm90 时创建
+           （deepseek_v4.py: hc_stats_stream = Stream() if _is_cuda and
+             (is_blackwell or is_sm90) and SGLANG_OPT_USE_MULTI_STREAM_OVERLAP
+             and hc_pre_from_prev else None）。
+           **HCU 上 hc_stats_stream 是 None** —— use_stats_stream 即使返回 True，
+           下面把 stats_stream 赋成 None，所有 wait/record 都退化成 no-op，
+           M 仍在主流程里内联执行（串在 S 之后、P 之前）。
+           HCU 的补偿是 ① 本身走 lightop 融合 kernel（Mega mHC），
+           而不是靠并行掩盖。
 
   ② combine（步骤 2）—— Σ_m pre[m]·R[m] + RMSNorm（+ 可选量化/打散）
        hc_combine（elementwise/hc_combine.py）/ hc_combine_norm

@@ -3114,6 +3114,29 @@ class DeepseekV4AttnBackend(
         exit_late_layer_tail.
 
         ==================================================================
+        ★ 执行顺序（六步，缺一步就会读到错的行/错的元数据）
+        ==================================================================
+          ① 存现场：saved = (forward_metadata, attn_cp_metadata,
+                            local_dp_buffer_len)
+             这三个都在后面被改掉，必须原样存下来给 exit 还原。
+          ② 桥接 candidate_metadata：整批的 request_masks / request_block_ids
+             按每请求末尾 t 行裁成尾段版本（t = local_lens_cpu 或 extend_seq_lens_cpu）。
+          ③ 桥接 sparse top-k 三件套：早层（L0..L20）已把 top-k 结果写进
+             【整批】元数据的 buffer；晚层要用同一批结果，所以按
+             tail.real_rows(...) 把尾行拷进【尾段】元数据的 buffer，
+             其余位置保持 -1（padding）。
+          ④ 换指针：self.forward_metadata = tail_metadata
+          ⑤ 三处"不还原、而是重设"的全局状态：
+               · request_window.activate(尾段 layout)   ← encoder replay 的环形缓冲
+               · CP：forward_batch.attn_cp_metadata = tail.cp_metadata
+                     + set_local_dp_buffer_len(Σ per_rank_actual_token)
+               · LayerSplit：reset_batch_active_pages()  ← 整批选页缓存作废
+          ⑥ 返回 saved（exit_late_layer_tail 用它还原 ①）
+
+          为什么要⑤：元数据换了但全局状态没换，后端仍按整批视图取页/取缓冲，
+          行数与页表立刻对不上（症状是读到别的请求的行，或越界）。
+
+        ==================================================================
         ★ 尾段元数据是【另一个对象】，不是"覆盖"也不是"在原对象上加字段"
         ==================================================================
         一次 forward 里同时存在两份 DSV4Metadata：

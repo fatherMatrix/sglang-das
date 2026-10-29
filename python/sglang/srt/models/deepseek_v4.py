@@ -5066,10 +5066,42 @@ class DeepseekV4Model(nn.Module):
         # PD disaggregation drives the capture set per batch; fall back to the
         # model-level set for the non-disaggregated path.
         # 【块 3】确定 DSpark 捕获集合。
-        #   PD 分离时由 batch 下发（P 侧知道要捕获哪些层给 D 侧 draft），否则用模型级配置。
-        #   capture_dspark 为真之后有两处影响：
-        #     · 每个命中层在层返回后取 mean 存 hidden（见块 5 的循环体）
-        #     · 整批禁用 TBO（重叠执行拿不到逐层完成的 hidden）
+        #
+        # ==================================================================
+        # "捕获集合"= 哪几层 target 的中间表示要存下来，交给 draft 用
+        # ==================================================================
+        # 背景：DSpark 的 draft 不自带编码器，它是"寄生"在 target 上的 ——
+        #   不重跑 target 层，而是直接拿 target 若干层的 hidden 当自己的上下文。
+        #   所以必须先决定"借哪几层"，这就是捕获集合。
+        #
+        # 两个来源（batch 优先）：
+        #   ① forward_batch.pd_hidden_capture_layer_ids
+        #        PD 分离时由 D 侧决定（按请求存在 pd_hidden_state(req).capture_layer_ids，
+        #        再由 get_pd_hidden_capture_layer_ids 汇总）。同一个 P 可能服务
+        #        多个不同 draft 的 D，所以集合是【按批】的。
+        #   ② self.dspark_layers_to_capture
+        #        非 PD 路径的模型级配置：来自 spec_aux_config.dflash_target_layer_ids，
+        #        经 set_dspark_layers_to_capture 过滤成
+        #        "落在本 PP stage [start_layer, end_layer) 内的层号"。
+        #
+        # 捕获什么（见块 9）：每个命中层的【注意力输入】state.residual
+        #   （combine/pre 之后、attention 之前），再按 hc_mult 通道取 mean。
+        #   不是层输出 —— 这一点和 eager 路径（取 hc_post 之后）不同。
+        #
+        # 存到哪：dspark_aux_hidden_states（PP=1 时是 AuxHiddenStatePacker，
+        #   按固定层数预分配；PP>1 时是 list，交给 PP 通道转发）；
+        #   PD 分离时随 KV 一起发给 D 侧。
+        #
+        # 三个连带影响（都能在别处对上）：
+        #   · 禁用 TBO：run_tbo = self._can_run_tbo(...) and not capture_dspark
+        #     （重叠执行拿不到"逐层已完成"的 hidden）
+        #   · 尾段：捕获层若在 late_layer_start 之前，要先 tail.rows(aux) 取行，
+        #     否则与后面读取的行序不一致
+        #   · mid-chunk：层循环只跑到 end_layer，捕获列表要在循环外补齐
+        #     （块 13），否则 draft 侧缺层
+        #   · 与 bounded replay 的护栏相关：CaptureHiddenMode.FULL 且【不是】
+        #     DSpark 捕获时，_check_late_layer_tail_readers 会直接拒绝 ——
+        #     因为那种模式需要全部 prompt 行的 hidden，而晚层只算了尾行。
         dspark_layers_to_capture = getattr(
             forward_batch, "pd_hidden_capture_layer_ids", None
         )

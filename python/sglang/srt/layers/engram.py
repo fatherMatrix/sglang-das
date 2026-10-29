@@ -1101,6 +1101,13 @@ class Engram(nn.Module):
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
+        #
+        # ★ 这一行就是"从 Engram 进 EngramEmbedding"的地方：
+        #     self.embed 是 nn.Module 子模块（见 __init__ 里的 EngramEmbedding(...)），
+        #     写成 self.embed(...) 等价于 self.embed.__call__(...)
+        #       → nn.Module.__call__  →  hooks  →  EngramEmbedding.forward
+        #   所以两者不是"二选一"：先 Engram.forward，再由它内部调
+        #   EngramEmbedding.forward（查表），最后调 engram_gate（门控）。
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
         if x.shape[0] == 0:
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an

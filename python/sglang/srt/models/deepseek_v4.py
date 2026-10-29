@@ -4932,6 +4932,49 @@ class DeepseekV4Model(nn.Module):
         #   注意力-DP 且 MoE 不走 a2a 时，各 rank 只有局部 token，但 MoE 路由与 engram
         #   哈希需要全局 token id → 跨 DP 组做一次 replicate gather。
         #   用 replicate 而不是 sum：attn_tp>1 时同一 id 会被重复持有，求和会重复累加。
+        #
+        # ==================================================================
+        # 逐层拆开看这一步
+        # ==================================================================
+        # 【为什么要"全局 id"】
+        #   两个消费者都按【token id】做决策，而不是按 hidden 做决策：
+        #     · hash 路由（engram）：gate 直接拿 token id 算专家集合
+        #         （mega_moe: topk_kwargs = {"input_ids": input_ids_global}
+        #           if moe.is_hash else {}）
+        #     · 层内 MoE：注意力-DP 下每个 rank 只算自己那几个 token 的注意力，
+        #       但 MoE 要按 token 派发 → 必须有"槽位 → id"的完整对应
+        #   若某 rank 只握有局部 id，槽位号与 id 就对不上，路由会取到别的 token。
+        #
+        # 【为什么只在 attn_dp>1 且没有 A2A 时才做】
+        #   · attn_dp_size == 1：本 rank 的 input_ids 就是它要路由的全部 token，
+        #     不需要跨组拼（本部署 tp8cp8dp1 → attn_dp 为 1，不做）
+        #   · 有 A2A（deepep）：token 在 dispatch 时按专家流动，路由用的是
+        #     dispatch 之后的本地 id，同样不需要"全局 id 表"
+        #   两个条件都成立时，才是"注意力按 DP 切、MoE 不搬 token"的组合，
+        #   这时才必须显式 gather。
+        #
+        # 【为什么是 replicate 而不是 partial/sum】
+        #   dp_gather 的 all-reduce 实现是"零填充 → 各 rank 写自己那段 → SUM"。
+        #   is_partial=False（replicate）时只有 attn_tp_rank==0 且 attn_cp_rank==0
+        #   的 rank 写，其余留 0 → SUM 出来就是原值；
+        #   若用 partial（所有 rank 都写），attn_tp>1 时同一 id 被写 tp_size 份，
+        #   SUM 后 id 被放大 tp_size 倍 —— 路由立刻错。
+        #
+        # 【为什么要 .clone()】
+        #   all_gather 分支里有 `local_tokens.fill_(0)`（非 partial 且
+        #   attn_tp_rank != 0 时把本地输入原地清零）。input_ids 是 forward_batch
+        #   里共享的张量，被清零会污染后续所有使用者 → 先拷贝一份再传进去。
+        #
+        # 【形状为什么是 (global_dp_buffer_len, 1)】
+        #   dp_gather 是面向二维 (rows, hidden) 的通用接口（也用于 hidden_states），
+        #   所以把 id 当成 hidden=1 的二维张量；squeeze(-1) 再还原成一维。
+        #
+        # 【你们的实际路径】
+        #   deepep 存在 → 第二条件不成立 → 走 else：
+        #       input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
+        #   ForwardBatch 里并没有这个字段（只有 CP v2 的 cp_shard_model_inputs 会
+        #   动态设置它），所以取到的就是 input_ids 本身 —— 零 gather、零拷贝。
+        # ==================================================================
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),

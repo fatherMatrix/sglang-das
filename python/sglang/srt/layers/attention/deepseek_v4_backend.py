@@ -3235,9 +3235,37 @@ class DeepseekV4AttnBackend(
         # TODO(candidate): goes away once the source publishes its tail rows straight
         # onto the tail metadata (publish_prefill); until then cut the full masks.
         #
-        # 它是什么：L20 那个"候选源层"发布的【候选块集合】，
-        #   request_masks      List[Tensor]  第 b 个请求一个 [rows_b, 候选列] bool 掩码
-        #   request_block_ids  List[Tensor]  第 b 个请求一个 [rows_b, K] 块号
+        # 它是什么：L20 那个"候选源层"发布的【候选块集合】。两个字段是同一份
+        #   候选集的两种表示（稠密掩码 / 稀疏块号），形状要分开记：
+        #
+        #     request_masks      List[Tensor]  长度 = bs
+        #                        第 b 项 → [rows_b, lc_b]   bool  稠密掩码
+        #                                     ↑ query 行   ↑ 该请求的压缩位置数
+        #     request_block_ids  List[Tensor]  长度 = bs
+        #                        第 b 项 → [rows_b, K_b]    int32 稀疏块号（-1 填充）
+        #
+        #   三个量的来历（ratio = 1/2，block_size = candidate_block_size = 8）：
+        #     rows_b = 该请求在本批的 query 行数
+        #              prefill 时 = extend_len（每个 token 都是一个 query）
+        #              尾段版 = min(128, extend_len)
+        #     lc_b   = 该请求的压缩域长度 = seq_b // ratio
+        #     K_b    = min(candidate_topk_blocks=2048, ceil(lc_b / 8))
+        #              每块 = 8 个压缩位置，所以块数上限是 ceil(lc_b/8)
+        #
+        #   举例（ratio=1）：
+        #     请求0：seq=8192 → lc=8192、块数=1024 → K=1024
+        #            request_block_ids[0] = [extend0, 1024] int32
+        #            request_masks[0]     = [extend0, 8192] bool   ← 稠密，非常贵
+        #     请求1：seq=64   → lc=64、块数=8      → K=8
+        #            request_block_ids[1] = [extend1, 8] int32
+        #     1M 上下文：lc=1M、块数=131072 > 2048 → K 顶到 2048
+        #
+        #   ★ 为什么实际常常只有 block_ids 有值：稠密掩码是 O(rows × seq)，
+        #     长上下文下不可接受。HCU 路径只发布紧凑的块号，掩码在消费端
+        #     `_prefill_candidate_mask` 里由块号重建（scatter → repeat_interleave(8)）。
+        #
+        #   ★ 每行的块号是【各自选出来的】（select_candidate_block_ids 逐行 top-k），
+        #     不是"每请求一份"——所以列宽 K_b 是该请求所有行里保留数最多的那个。
         # 谁写的：候选源层（candidate_source_layer_id=20）在 publish_prefill 里发布。
         # 谁读的：后面那些 uses_candidates 的索引层（24/28/32/36），只在池子里搜。
         #

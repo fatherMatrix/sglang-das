@@ -4548,9 +4548,25 @@ class DeepseekV4Model(nn.Module):
                         global_ids >= MM_PAD_SHIFT_VALUE,
                         self.engram_hasher.image_token_id,
                     )
+                # ① 哈希是在【全局】行上算的：
+                #      hash_ids 形状 [total, L, C]
+                #        total = 全局行数（含执行 padding），例 136
+                #        L     = engram 层数，C = n-gram 阶数
+                #      第 i 行 = 全局第 i 个 token 的哈希（已用前驱算好）
                 hash_ids = self.engram_hasher(global_ids, forward_batch)
                 parallel = get_parallel()
+                # ② 取本 rank 的行，规则与切 hidden 完全一致（i % cp_size）：
+                #      [rank::cp] 的第 k 项 = 全局第 rank + k*cp 行
+                #      正好等于 cp_split_and_rebuild_data 里本 rank 的第 k 行。
+                #      例：cp=8、total=136 → 每个 rank 17 行。
+                #    为什么可以直接切：哈希是【逐行独立】的（每行的前驱已在
+                #    全局输入里算进去），所以切行不破坏结果。
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+                # ③ 本 rank 的 hidden 可能比切片多几行 —— 那是"每 rank 物理长度
+                #    对齐"补出来的（cp_v2 的 pad_local_rows / per_rank_actual_token
+                #    会把它对齐到 cp_size 的倍数；例如逻辑 17 行 → 物理 24 行）。
+                #    这些行没有真实 token，补【全零哈希】占位即可，
+                #    保证与 hidden 逐行对齐、后续按行索引不越界。
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
                 if pad_rows > 0:
                     hash_ids = torch.cat(

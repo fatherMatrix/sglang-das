@@ -4803,6 +4803,25 @@ class DeepseekV4Model(nn.Module):
                 #   留到下一层的边界 kernel 里和它的 hc_pre 一起算 —— 一次启动代替
                 #   两次；数值结果与块 12 完全一致（见 forward_layer_fused_boundary
                 #   的 docstring，以及 defer_post 在 Engram / DSpark 捕获层上的例外）。
+                #
+                # ★ 但要说清"HCU 走块 12 没有损失"这句话不严谨：
+                #   HCU 上【确实少了这次融合】，代价是每层多一次 kernel 启动。
+                #   量级估计：40 层 × ~1 次 × 2~4 µs ≈ 80~160 µs / 次 forward；
+                #   相对千 token 级 prefill（几十 ms）< 1%，decode 步里约 0.5~1%。
+                #   所以准确说法是"没有相对回退"，而不是"没有优化空间"。
+                #
+                # ★ 为什么 HCU 拿不到这条融合（三条硬约束）：
+                #   ① V4.1 用不了通用的跨层 post+pre 融合：
+                #        hc_pre_from_prev_sublayer=True → use_fused_mhc_post_pre
+                #        被显式置 False（pre 已经由上一层顺带算出，语义变了）；
+                #   ② 通用融合在 upstream 就排除了 HCU，注释原话：
+                #        "HCU has no TileLang mHC kernel, so it must never take
+                #         this path."（deepseek_common/amd/deepseek_v4_fused_mhc.py）
+                #   ③ 块 11 这条是 gfx950 专用替代方案，依赖 aiter/ROCm 侧 kernel
+                #        （mhc_post_split_h / hc_boundary_fused_deferred），
+                #        HCU 上没有对应实现 → hc_boundary_fused 恒 False。
+                #   要做的话需要给 HCU 写一个"post 推迟 + 下个边界一起算"的融合
+                #   kernel（HcPending 协议照搬即可），属于待做的优化项。
                 if _is_hip and self.layers[i].hc_boundary_fused:
                     state = _hip.forward_layer_fused_boundary(
                         self,

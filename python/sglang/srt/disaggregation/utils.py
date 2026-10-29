@@ -1099,7 +1099,26 @@ def filter_kv_indices_for_cp_rank(
     index_slice: slice,
     total_pages: Optional[int] = None,
 ) -> Tuple[np.ndarray, slice]:
-    """Filters kv_indices and index_slice for the current CP rank."""
+    """Filters kv_indices and index_slice for the current CP rank.
+
+    ==================================================================
+    非 LS 的 P 侧 CP：把"整段页"按 CP rank 切成 8 段连续区间，各发一段。
+    ==================================================================
+    前提（这条前提是理解 PD + CP 的关键）：
+      P 侧 CP 只切 token 的行，**不切 KV 池** —— 每个 CP rank 都持有【全量副本】
+      （压缩器在每个 rank 上按全局顺序把整段状态写一遍）。所以"谁发哪一段"
+      可以任意切，只要 8 段拼起来是完整的。这里选择【连续区间】而不是轮转，
+      因为接收端按页搬，连续区间对 mooncake 的批量写更友好。
+
+    调用处：CP size>1 时按 rank 取 [rank_start, rank_end) 这段页；
+    只有 enable_all_cp_ranks_for_transfer 为真时才会走到这里（否则只有 rank0 发，
+    其余 rank 是 dummy）。
+
+    ★ 这个"任取一段"的能力在 LS 下【不成立】：LS 的每个 rank 只持有自己的层，
+      页集合不再相同，只能按 (family, layer) 描述符一一配对
+      （见 cp_cache_layer_split/transfer.py 与 requires_descriptor_matched_transfer）。
+    ==================================================================
+    """
     if total_pages is None:
         total_pages = len(kv_indices)
     cp_rank = kv_mgr.attn_cp_rank

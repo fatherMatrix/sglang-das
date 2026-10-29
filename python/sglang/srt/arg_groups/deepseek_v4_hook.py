@@ -304,6 +304,41 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "serve this model."
             )
 
+    # ==================================================================
+    # 【门1】V4.1 + DSPARK + PD 的拓扑白名单（三道门里的第一道）
+    # ==================================================================
+    # 位置：ServerArgs 校验阶段 → 配置不合法就【启动即失败】，不会等到跑请求。
+    # 判据分两组，两组都要满足：
+    #
+    #   ① common_invalid（HCU 与非 HCU 共用）
+    #        · ragged_verify 必须是 STATIC
+    #            static = 每请求每步按固定 block size 起草/验证，num_draft_tokens
+    #            是常量 ⇒ 两端的 pair ring 与 draft KV 布局能逐字节对齐。
+    #            cap-accept / compact 模式按 confidence head 动态定长度，做不到。
+    #        · 传输后端必须是 mooncake（目前只有它有 V4.1 的按条目配对能力）
+    #        · dcp_size == 1（decode CP 与按请求存放的 pair ring 不兼容）
+    #
+    #   ② topology_invalid（分平台，这是 HCU 与 upstream 唯一的分歧点）
+    #        HCU  P（prefill）：replica DP=1、attention DP=1、
+    #                          **必须开 prefill CP**、且 attn_cp_size == tp_size
+    #        HCU  D（decode） ：replica DP=1、attn_dp_size == tp_size、
+    #                          attention DP 开启、**不许开 prefill CP**、CP=1
+    #        非 HCU           ：两端 CP 都必须为 1（#40177 版的保守规则）
+    #
+    # ★ "必须开 CP"是 HCU 自己加的，理由是【只验证过这一种拓扑】，
+    #   而不是 MLA 在架构上要求 CP。upstream v0.5.22（含 #40323）里 P 的 CP
+    #   是可选的，只校验 attention TP 对齐 —— 这就是六、七章说的"fork 未合入
+    #   #40323"的后果：HCU 比 upstream 收紧。
+    #
+    # ★ 这道门是"死亡三角"的第一条边：
+    #     门1 要求 P 必须开 CP  →  门2 要求 CP>1 时必须用 LS  →  门3 禁止 LS+HiCache
+    #   于是 "CP + DSpark + PD + HiCache" 在 HCU 上没有合法配置。
+    #   注意：门2 是 fork 为 LS 开的例外，不是 upstream 的规则。
+    #
+    # 溯源（详见文档 §3.0）：upstream #38949 立白名单、#38798 收紧为"DP=1 且 CP=1"、
+    # #40323 放开 CP=1 限制；fork 在 8e7840f432 加了 HCU 分支，9e40fb07f6 rebase
+    # 时只带到 #40177 版 → 所以这里的 elif 文案仍是 "CP=1 on both servers"。
+    # ==================================================================
     if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyMode,

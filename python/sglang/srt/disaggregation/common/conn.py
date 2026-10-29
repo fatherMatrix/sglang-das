@@ -395,6 +395,16 @@ class CommonKVManager(BaseKVManager):
             self.is_hybrid_mla_backend
             and disaggregation_mode == DisaggregationMode.DECODE
         )
+        # 【PD 传输：谁参与发送】三个来源任一为真，就让【所有 CP rank 都发】：
+        #   · 环境变量 SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER（本部署=1）
+        #   · cp_sharded_prefill：P 侧 CP 且 KV 按 rank 分片（LS 或 DSA layer split）
+        #   · hybrid_decode_pulls_all_ranks：D 侧 hybrid-MLA 要逐个 rank 拉
+        # 为假时只有 CP rank0 发，其余 rank 被标成 dummy（见下面的 is_dummy_cp_rank）。
+        #
+        # ★ 为什么需要"全 rank 都发"：非 LS 时每个 rank 都持有【全量副本】，
+        #   只让 rank0 发就是单点带宽瓶颈；让 8 个 rank 各发连续的 1/8 页区间
+        #   （filter_kv_indices_for_cp_rank）能把发送带宽摊薄 8 倍。
+        #   LS 时每个 rank 持有不同层，本来就只能各自发（见 requires_descriptor_matched_transfer）。
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
@@ -1271,7 +1281,33 @@ class CommonKVManager(BaseKVManager):
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
-        Returns True if info is available (cached or freshly fetched)."""
+        Returns True if info is available (cached or freshly fetched).
+
+        ==================================================================
+        D 侧"第一次见到 P"时做的握手：向 bootstrap 要 PrefillServerInfo，
+        然后【按固定顺序】逐项比对。哪一项不过就抛，且是懒执行的。
+        ==================================================================
+        调用链（D 侧）：
+            DecodePreallocQueue._resolve_pending_reqs
+              → _ensure_prefill_info
+                → 本函数（GET /route?…=-1，-1 表示"我要汇总信息，不指定 rank"）
+                  → 成功后 _resolve_rank_mapping 算 rank 映射
+
+        ★ 懒执行的含义：P 能起来、health 是 200，直到【第一个请求】到来才炸。
+          所以排查"部署看起来正常但一发请求就崩"时，第一个要看的就是这里。
+
+        校验顺序（下面的代码就按这个顺序）：
+          ① page_size      两端必须相同（决定 slot 编号粒度）
+          ② kv_cache_layout  同上（V4 / V41 布局不同则页内偏移算错）
+          ③ kv_cache_dtype   同上（fp8/bf16 混用会读出错值）
+          ④ dsv41_spec_layout  V4.1 + DSPARK 专属：位置性布局逐字段比对
+             （draft token 数 / 压缩比序列 / 每个 KV 与状态条目的层 id 与
+              per-token 字节数），这是"能不能按条目配对搬运"的依据
+          ⑤ CP 拓扑（门2）  P 侧 CP 与 LS 的组合是否放行
+          ⑥ _resolve_rank_mapping  算 (target_tp_rank, target_pp_rank) →
+             (prefill_dp_rank, prefill_cp_rank) 的对应关系
+        ==================================================================
+        """
         if bootstrap_addr in self.prefill_info_table:
             return True
 
@@ -1507,7 +1543,38 @@ class CommonKVManager(BaseKVManager):
         return synced_port
 
     def register_to_bootstrap(self):
-        """Register prefill server info to bootstrap server via HTTP PUT."""
+        """Register prefill server info to bootstrap server via HTTP PUT.
+
+        ==================================================================
+        P 侧注册（PD 握手的第一步）：把自己"是谁、怎么搬数据"上报给 bootstrap。
+        ==================================================================
+        时机：CommonKVManager.__init__ 里，disaggregation_mode==PREFILL 时调用一次
+              （见上面的 is_dummy_cp_rank 分支之后）。
+              ★ 连 dummy CP rank 也要注册 —— D 侧靠"每个 rank 一条记录"来算
+                rank 映射（_resolve_rank_mapping），少一条就拼不出 8 个 rank 的对应关系。
+
+        payload 里这几项决定了后面的兼容性检查，值得单独记住：
+          page_size / kv_cache_layout / kv_cache_dtype
+              两端必须一致，否则页内偏移或数值宽度对不上
+          dsv41_spec_layout
+              V4.1 + DSPARK 专属的"位置性布局"（draft token 数 / 压缩比序列 /
+              每个 KV 与状态条目的层 id 与 per-token 字节数）。
+              ★ 只有压缩比里含 2 且开了 DSPARK 才非 None（见 get_dsv41_spec_layout），
+                所以 V4 Pro 永远不带这个字段。
+          attn_cp_size / attn_tp_size / attn_dp_size / system_dp_*
+              给 D 侧算 rank 映射、以及做门2 的 CP 拓扑判定
+          cp_cache_layer_split
+              P 是否在用 LayerSplit；D 侧据此判断能不能走"描述符匹配"的搬运
+          prefill_http_port
+              让 D 侧能自己推出 rebootstrap 用的 /generate URL，
+              不需要 router 额外注入 pd_rebootstrap_prefill_url
+
+        注册完成后，bootstrap server 会校验【同一次部署内各 rank 上报的
+        dsv41_spec_layout 是否一致】，不一致直接 400
+        "layout differs across prefill ranks" —— 因为布局是批次级契约，
+        多个 rank 描述不同就意味着这批 P 配置本身不统一。
+        ==================================================================
+        """
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host

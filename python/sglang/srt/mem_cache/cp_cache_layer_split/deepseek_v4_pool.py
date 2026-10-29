@@ -302,7 +302,30 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         return layout
 
     def get_hicache_host_layer_mapping(self) -> dict[str, dict[int, int]]:
-        """Per-family ``{pp_local_layer_id -> local_buffer_index}`` for HiCache."""
+        """Per-family ``{pp_local_layer_id -> local_buffer_index}`` for HiCache.
+
+        ==================================================================
+        ★ 这是一个【半成品】：全仓库没有调用方，而且家族覆盖不全。
+        ==================================================================
+        用途（如果接上的话）：HiCache 的 host 池按"每层一块 buffer"组织，
+        它需要把"pp 局部层号"映射到"本 rank buffer 数组的下标"。LS 池只给
+        owned 层分配 buffer，所以这个映射不是恒等映射，必须由池自己给出。
+
+        现状的两个问题：
+          ① 没有任何调用方 —— build_deepseek_v4_hicache_stack 走的是
+             _resolve_deepseek_v4_layer_mappings 的【恒等映射】，
+             它假设"每层都有 buffer"，与 LS 冲突（这就是门3 的根因之一）。
+          ② 不覆盖 c1/c2 —— 只造了 swa / c4 / c128 三个家族，
+             而 V4.1 唯一的压缩家族恰恰是 c1/c2。
+
+        要把 LS + HiCache 真正打通，至少还需要：
+          · 让 build_deepseek_v4_hicache_stack 在 LS 池上使用本函数（而不是恒等映射）
+          · 补 c1/c2 两个家族
+          · 处理三处语义冲突：H2D 回载会覆写 owner 的持久 buffer、
+            staging 重映射缓存的是"覆写前"的读状态、静态选页缓存
+            _batch_active_pages 需要作废（详见 validation.py 的门3 注释）
+        ==================================================================
+        """
         pp_start = self._stage_start
 
         swa_layers_sorted = sorted(

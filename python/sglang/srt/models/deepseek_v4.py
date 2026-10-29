@@ -4942,45 +4942,43 @@ class DeepseekV4Model(nn.Module):
         #         （mega_moe: topk_kwargs = {"input_ids": input_ids_global}
         #           if moe.is_hash else {}）
         #     · 层内 MoE（仅当 attn_dp>1 且无 A2A，见 _run_moe_ffn_dp_sync 的
-        #       _use_tp_moe_gather）：
-        #         attention 只算【本 rank 的请求】→ hidden 只有 M_local 行。
-        #         TP-MoE 的专家按【专家号】分片（rank r 只持有 1/tp 的专家，
-        #         如 256 里 32 个），而"某个 token 用了哪 k 个专家"是数据决定的。
+        #       _use_tp_moe_gather）
         #
-        #         ★ 专家计算【不是】全量冗余：
-        #           fused_experts 只对"选中了本地专家"的 (token, expert) 对做
-        #           matmul，其余对由 expert_map 映射成 -1 直接跳过
-        #           （moe_align_block_size 的 docstring：非本地专家 → -1，
-        #            于是 MoE matmul 就 skip 这些 block）。
-        #           所以每 rank 的专家 FLOPs ≈ M_global × k / tp，与 A2A 相同。
+        # ==============================================================
+        # 无 A2A（TP-MoE）时 MoE 的四步
+        # ==============================================================
+        #   前提：attention 按 DP 切成 M_local 行/rank；
+        #         专家按【专家号】分片（rank r 只有 1/tp 的专家）；
+        #         gate 权重是【复制的】（MoEGate.weight 是 (E, H) 全量参数）。
         #
-        #         ★ 但【输入必须是全量】：
-        #           在 kernel 之前没法把"会用到本地专家的 token"挑出来 ——
-        #           要挑就得先算 topk，而 topk 又需要 hidden。所以非 A2A 的流程是：
-        #             ① dp_gather_replicate：hidden 拼成 M_global 行，
-        #                本 rank 的 local 行落在 [start_r, start_r+M_local) 槽位
-        #             ② gate（router）在【全量】行上算 logits
-        #                  —— 这才是真正冗余的部分：M_global × num_experts，
-        #                     每个 rank 都算一遍（权重是复制的）
-        #             ③ fused_experts 用 expert_map 跳过非本地专家
-        #             ④ post_experts_all_reduce：各 rank 的 partial 求和
-        #                （一个 token 的 k 个专家分散在不同 rank，必须 SUM）
+        #   ① dp_gather_replicate：把 hidden 拼成 M_global 行
+        #        本 rank 的 local 行落在全局 buffer 的 [start_r, start_r+M_local)
+        #   ② gate 在【全量】行上算 logits + top-k
+        #        —— 这是唯一的真冗余：M_global × E，每 rank 一遍
+        #   ③ fused_experts 只算"本地专家被选中"的 (token, expert) 对，
+        #        非本地专家由 expert_map = -1 直接 skip
+        #        ⇒ 专家 FLOPs ≈ M_global × k / tp，【不冗余】
+        #   ④ post_experts_all_reduce：各 rank 的 partial 求和
+        #        —— 一个 token 的 k 个专家分散在不同 rank，必须 SUM
         #
-        #         所以 topk/ids 也是全量行：global_ids[i] 必须是第 i 个槽位那个
-        #         token 的 id。手里只有 M_local 个 id，不拼成同一套槽位，
-        #         第 i 行就查到别的 token 的 id（或越界）——这就是"槽位 → id
-        #         一一对应"的含义。
+        #   ⇒ 所以 ② 的 topk 是"全量行"的，ids 也必须按同一套槽位拼成
+        #     M_global：global_ids[i] 对应第 i 个槽位那个 token。
+        #     本 rank 只有 M_local 个 id，不拼就会查到别的 token（或越界）。
+        #     这就是"槽位 → id 一一对应"的含义，也是本块要 gather 的原因。
         #
-        #     ★ 对照：有 A2A（deepep / megamoe）时把 token 搬到专家那里：
-        #           gate 只在本地 M_local 行上算（不冗余）；
-        #           dispatch 把 k×M_local 行发给对应专家所在的 rank；
-        #           专家 FLOPs 仍 ≈ M_global×k/tp（与上面一样）；
-        #           本地 input_ids 就够，不需要全局 id 表。
-        #         差别不在专家计算量，而在：
-        #           · 数据：全量 all-gather（M_global 行常驻）vs 按需 all-to-all
-        #           · gate：全量算 M_global 次 vs 本地算 M_local 次
-        #         这就是本块第二个条件 get_moe_a2a_backend().is_none() 的来源。
-        #   若某 rank 只握有局部 id，槽位号与 id 就对不上，路由会取到别的 token。
+        # ==============================================================
+        # 对照：有 A2A（deepep）时把 token 搬到专家那里
+        # ==============================================================
+        #   ① gate 只在【本地】M_local 行上算（不冗余）
+        #   ② dispatch 把 k×M_local 行发给对应专家所在的 rank
+        #   ③ 专家 FLOPs 仍 ≈ M_global×k/tp（与上面第 ③ 步相同）
+        #   ④ combine 把结果发回源 rank 累加
+        #
+        #   差别不在专家计算量，只在：
+        #     · gate 范围：M_global 行（每 rank 全算一遍） vs M_local 行
+        #     · 数据形态：全量 all-gather（M_global 行常驻） vs 按需 all-to-all
+        #   ⇒ 路由只针对本地 token，所以【本地 input_ids 就够】，
+        #     不需要全局 id 表 —— 这就是本块第二个条件的来源。
         #
         # 【为什么只在 attn_dp>1 且没有 A2A 时才做】
         #   · attn_dp_size == 1：本 rank 的 input_ids 就是它要路由的全部 token，

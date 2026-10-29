@@ -4631,6 +4631,13 @@ class DeepseekV4Model(nn.Module):
                 end_layer = self.late_layer_start
                 _log_mid_chunk_decoder_skip_once(end_layer)
             else:
+                # 注意这里只取【行清单】，不是整份元数据：
+                #   attn_backend.tail_forward_metadata : DSV4Metadata  尾段的整份元数据
+                #     └─ late_layer_tail : LateLayerTail               尾段的"行描述"
+                # 块 4 只需要"哪些行"（token_indices / positions /
+                # extend_seq_lens / real_rows），整份元数据要等走到
+                # late_layer_start 时才由 enter_late_layer_tail 整体换上
+                # （那时才切 self.forward_metadata 指针）。
                 tail = attn_backend.tail_forward_metadata.late_layer_tail
         # 【块 5】mHC 状态初始化。
         #   HcState 携带 residual 与"上一层的 pre-mix"；本路径的层不返回元组，

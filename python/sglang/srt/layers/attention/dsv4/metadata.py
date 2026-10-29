@@ -200,7 +200,23 @@ class PagedIndexerMetadata:
 
     page_size: int
     compressed_page_size: int
+    # page_table: (行数, 最多页数) —— 和 core 的 page_table 同源，但粒度是压缩域：
+    #   第 j 列 = "第 j 个压缩条目的页号"。
+    #
+    #   两种来源：
+    #     · ratio 4（V4 Pro）：直接沿用 core.page_table
+    #     · ratio 1/2（V4.1）：core.page_table 经 expand_index_page_table 展开，
+    #       因为 indexer-K 池按 compressed_page_size（64 或 128 slot）分页，
+    #       比 page_size // ratio 更碎：一个 full page 要展开成 blocks_per_page 块
+    #   读取方式（kernel 侧）：第 j 个压缩 slot
+    #       = page_table[b, j // compressed_page_size] * compressed_page_size
+    #         + j % compressed_page_size
+    #
+    #   消费者只有一个方向：indexer 打分后把"第几个块"换成物理 slot
+    #   （dsv4/indexer.py 的 topk_transform_paged 系列）。
     page_table: torch.Tensor
+    # compressed_seq_lens: (bs,) —— 每元素 = 一个请求，压缩域长度 ≈ ceil(seq / ratio)
+    #   （V4.1 取 c1/c2_topk_lengths_clamp1，所以是按请求的、不能从行数推）
     compressed_seq_lens: torch.Tensor
     use_topk_v2: bool
     force_deep_gemm_metadata: bool = False

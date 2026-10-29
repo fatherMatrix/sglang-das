@@ -620,10 +620,31 @@ class DSV4AttnMetadata:
     """
 
     page_size: int
+    # page_table: (行数, 最多页数) int32 —— "逻辑页序号 → 物理页号"的查找表。
+    #
+    #   ★ 一行【不是】"这个 token 在哪一页"，而是【该行所属请求】的页号序列：
+    #       第 j 列 = 这个请求第 j 页在池里的页号
+    #     （"token 自己在一个 slot / 一页里"由 positions_casual 与 *_out_loc 表达）
+    #
+    #   ★ 怎么来的（build_page_table_positions）：
+    #       req_to_token[req, ::page_size]     每页取一个代表（页内 slot 连续）
+    #       ... // page_size                   slot → 页号
+    #     列数 = max_seq_len // page_size；同请求的所有 token 行内容相同，
+    #     做成"每 token 行"只是让 kernel 用 row=program_id 直接取。
+    #     实际只用到前 ceil(seq_lens_casual[i] / page_size) 列。
+    #
+    #   ★ 谁在读它（V4.1 prefill）：只被 indexer 侧使用 ——
+    #       · dsv4/indexer.py 的 topk_transform_paged：把"第几个压缩块"
+    #         换算成物理 slot（写进 c1/c2_sparse_page_indices）
+    #       · init_forward_metadata_indexer：expand 成 64-slot 粒度索引页表
+    #     主稀疏注意力 kernel 不读它（它读 indexer 产出的 sparse_page_indices）。
     page_table: torch.Tensor
     raw_out_loc: torch.Tensor
     cuda_int32_kwargs: dict
 
+    # seq_lens_casual / positions_casual: (行数,) —— 每元素 = 一个 token
+    #   seq_lens_casual[i] : 第 i 行的因果长度（可读多远）
+    #   positions_casual[i]: 第 i 行的绝对位置（= seq_lens_casual[i] - 1）
     seq_lens_casual: torch.Tensor
     positions_casual: torch.Tensor
 

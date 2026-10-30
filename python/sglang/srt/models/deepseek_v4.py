@@ -2559,6 +2559,47 @@ class MQALayer(MqaAttentionBase):
         #   unified_fp8_decode  ：decode/idle 或 verify，读环上的 fp8 行
         #   unified_fp8_prefill ：prefill，读本 chunk 的 packed Q/K
         #   非 unified          ：常规 bf16 路径（HCU 生产形态走这条）
+        #
+        # ==================================================================
+        # unified_kv 是什么、为什么要它
+        # ==================================================================
+        #   它是一个【平坦 KV 池】：一个行号就是槽位，attention kernel 用 paged
+        #   indices 直接寻址，不在每 forward 拼中间张量。
+        #   池内两段（runtime.py，page_size=1、row-major）：
+        #       rows [0, swa_pages)        SWA 环（state_slot*win + pos%win）
+        #       rows [swa_pages, ...)      压缩 K（swa_pages + page_index）
+        #
+        #   它替代的东西叫 kv_flat_sa —— 原先每 forward 要把"本批要读的 KV"
+        #   物化成一个 packed 张量，而它的形状取决于运行期值
+        #   （n_committed_per_seq，每个 forward 都可能变）→ **阻塞 CUDA Graph
+        #   捕获**（paged_decode.py 的 docstring 原文：replaces the per-fwd
+        #   kv_flat_sa materialization ... blocks CG capture）。
+        #   改成"池 + paged 索引"后：形状恒定、可捕获，且省一次物化拷贝。
+        #
+        #   三种读写 ABI 对应三个 kernel：
+        #     decode/idle/verify → paged_decode：单源（环上的 fp8 行）
+        #     prefill            → paged_prefill：双源 —— paged 历史（unified_kv）
+        #                           + 本 chunk 的 flat kv。所以下面
+        #                           unified_fp8_prefill 才要求"本 chunk 的 K 也在
+        #                           池的布局里"，且与多流互斥（多流没有 unified 分支）
+        #     非 unified         → 常规 bf16：k_rope/k_nope 分开、每 forward 物化
+        #
+        #   fp8 变体为什么限 gfx95（env_gate.py）：
+        #     双池 fp8 是 OCP e4m3 + E8M0 tile scale，只在 MX 原生的架构上有意义；
+        #     gfx94x 上 sglang 的 fp8_dtype 是 e4m3fnuz（最大值 224 而非 448），
+        #     writer 写进去的值会被池自己的 dtype 读错 → 直接回退 bf16 并告警。
+        #     行布局：DSV4_FP8_NOPE_ROW_BYTES = 512（448 latent + 14 B 的 7 个
+        #     tile scale（asm reader 每个读两遍）+ 50 B 没人碰）。
+        #
+        #   ★ HCU 判定（两层门，都看 env）：
+        #       is_unified_kv_triton() = is_hip() and
+        #                                SGLANG_HACK_FLASHMLA_BACKEND == "unified_kv_triton"
+        #         该 env 默认 "auto" → False。注意 HCU 本身 is_hip() 为真，
+        #         所以【手动设成 unified_kv_triton 会把 bf16 版打开】。
+        #       is_unified_kv_fp8() = 上者 and SGLANG_DSV4_UNIFIED_KV_FP8（默认 False）
+        #                            and is_gfx95_supported()
+        #         → HCU 恒 False，且会打一条 warning 后回退。
+        #     默认部署（auto）下走"非 unified 的常规 bf16 路径"。
         unified = is_unified_kv_triton()
         unified_fp8_verify = (
             unified

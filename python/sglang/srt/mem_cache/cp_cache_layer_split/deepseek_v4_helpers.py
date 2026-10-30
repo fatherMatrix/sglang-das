@@ -39,20 +39,41 @@ def _get_core_attn_metadata():
 
 
 def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
+    """发起「借本层 SWA 窗口 KV」的预取（LayerSplit 的第 1 + 第 2 轮）。
+
+    ★ 两重门，任一不成立就是 no-op —— 所以这个函数可以在所有路径上无脑调用：
+        ① pool 必须是 LS 池（isinstance 检查）
+        ② 本批必须是 CP extend
+      注意 ② 故意不看 attn_cp_metadata：即使"短 extend / warmup 批"没有那份
+      元数据，它仍在读层分片后的 cache，所有 CP rank 也必须同序参与。
+    """
     if _should_sync_cp_cache_layer_split(pool, forward_batch):
         metadata = get_attn_backend().forward_metadata
+        # sparse_prefill_cache：本 forward 的"稀疏 prefill 工作区"，
+        # 由【第一次】稀疏 attention 建出来，里面缓存了
+        #   · swa_token_ids           本批要读的 SWA 行号（精确）
+        #   · ensure_compressed(ratio) 每个压缩家族的 flat_token_ids
+        # 所以第一次走到这里时它是 None，只能按上界估（见下面两支）。
         cache = getattr(metadata, "sparse_prefill_cache", None)
-        read_token_capacity = None
+        read_token_capacity = None      # ← 给 C2 静态选页的上界（行数）
         num_reqs = cache.num_reqs if cache is not None else None
         if cache is None:
+            # ── 还没有工作区：只能估上界 ───────────────────────────────
             tail = metadata.late_layer_tail
             if tail is not None:
                 # Replay floors exclude SWA history before each request's tail.
+                # ↑ 尾段：每请求只读最后 min(128, extend) 行，而 replay 的
+                #   floor 已经把 tail 之前的 SWA 历史排除掉 →
+                #   Σextend 就是【精确行数】，不是上界。
                 extend_lens = tail.extend_seq_lens_cpu
                 read_token_capacity = sum(extend_lens)
             else:
                 # Before the first sparse attention builds its cache, bound the
                 # full CP union, including the history before this extend chunk.
+                # ↑ 首个稀疏 attention 之前，并不知道实际会读哪些行，
+                #   只能按"整个 CP 并集"估，且必须带上本 extend 之前那
+                #   SWA_WINDOW-1 个历史 token（滑窗跨 chunk 边界要回看）。
+                #   min(seq, extend + window - 1)：新请求不满一个窗口时取 seq。
                 extend_lens = forward_batch.extend_seq_lens_cpu
                 read_token_capacity = sum(
                     min(seq_len, extend_len + pool.sliding_window - 1)
@@ -60,15 +81,21 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
                         forward_batch.seq_lens_cpu.tolist(), extend_lens, strict=True
                     )
                 )
+            # C2 上界公式 ceil(tokens/ps) + 2*num_reqs 需要请求数
             num_reqs = len(extend_lens)
         # Sparse prefill dequantizes the full gathered SWA span, not only the
         # per-query attention indices.
+        # ↑ 这句解释 read_indices 为什么用【整段 span】而不是 per-query 索引：
+        #   反量化是按"gather 后的整段 SWA"做的，只搬 query 索引覆盖到的页
+        #   会让 kernel 读到未反量化的数据。
         pool.prefetch_swa_layer(
             layer_id,
+            # 读集合：本层要读哪些页（来自 core 元数据，非 per-query）
             _get_core_attn_metadata().swa_page_indices,
+            # 精确读行（None 表示让池按 num_reqs / read_token_capacity 估上界）
             read_indices=cache.swa_token_ids if cache is not None else None,
-            num_reqs=num_reqs,
-            read_token_capacity=read_token_capacity,
+            num_reqs=num_reqs,                    # 仅 C2 用
+            read_token_capacity=read_token_capacity,   # 仅 C2 用
         )
 
 
@@ -78,25 +105,45 @@ def maybe_wait_cp_kv_swa_prefetch(pool, layer_id: int, forward_batch=None) -> No
 
 
 def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
+    """发起「借 C1/C2 压缩 KV」的预取。与 swa 版的三点不同：
+
+      ① 只有 ratio ∈ {1,2} 的层需要（ratio 0 层没有压缩家族，直接跳过）；
+      ② 读集合来自 **indexer 选中的块**（sparse_page_indices(ratio)），
+         不是 core 的逐行页表；
+      ③ 多一个 cache_full_read 标志：表示"这次要按整段历史读"，
+         因为它影响 staging 的容量估算（不是安全开关）。
+    """
     if _should_sync_cp_cache_layer_split(pool, forward_batch):
+        # 本层的压缩比；V4.1 是 1/2，V4 Pro 是 4/128（后者不进这个函数）
         ratio = pool.compression_ratios[layer_id]
         if ratio in (1, 2):
             metadata = get_attn_backend().forward_metadata
             cache = getattr(metadata, "sparse_prefill_cache", None)
             core = _get_core_attn_metadata()
-            read_indices = None
-            read_token_capacity = None
-            cache_full_read = False
+            read_indices = None            # 精确读行（有 cache 时才有）
+            read_token_capacity = None     # 上界（无 cache 时用）
+            cache_full_read = False        # 是否声明"整段历史"
             num_reqs = cache.num_reqs if cache is not None else None
             if cache is not None:
                 # The workspace dequantizes every compressed position before
                 # TopK selects rows; broadcasting only TopK pages is unsafe.
+                # ↑ 关键：workspace 在 TopK【之前】就把所有压缩位置反量化了，
+                #   所以只广播 TopK 选中的页是不够的（会缺数据）→ 必须按
+                #   ensure_compressed() 给出的"全量压缩位置"取行。
+                #   flat_token_ids = 该家族压缩域里的行号（摊平后）。
                 read_indices = cache.ensure_compressed(
                     ratio, core.page_table, pool.kv_pools[ratio].page_size
                 ).flat_token_ids
                 # With explicit sparse prefill and nonempty original CP shards,
                 # every rank builds the full-history gather before this source.
                 # Tail metadata may later drop that cache, but not the KV data.
+                # ↑ 三个条件全真才声明"整段读"：
+                #   ① ratio == 1        —— 只有 C1 家族走这条 full-history 路径
+                #   ② 开了显式 sparse prefill（FLASHMLA_SPARSE_PREFILL）
+                #   ③ min(extend) >= cp_size —— 原 CP 分片非空；若某 rank 本地
+                #      一行都没有，它不会建 full-history gather，声明整段就是浪费
+                #   注意 tail 元数据之后可能把 cache 丢掉，但 **KV 数据不会丢**，
+                #   所以这里宁可按整段声明（容量偏大是安全方向）。
                 cache_full_read = (
                     ratio == 1
                     and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -105,6 +152,9 @@ def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
             elif metadata.late_layer_tail is not None:
                 # Tail queries can select keys anywhere in each full history.
                 # Bound their page union without materializing a chunk cache.
+                # ↑ 没有 cache 但有尾段元数据：尾段 query 可能选中任一整段历史
+                #   里的键 → 只能按"每请求压缩域全长"估并集上界。
+                #   ceil(seq/ratio) 就是该请求压缩后的位置数。
                 seq_lens = forward_batch.seq_lens_cpu.tolist()
                 read_token_capacity = sum(
                     (seq_len + ratio - 1) // ratio for seq_len in seq_lens
@@ -112,9 +162,10 @@ def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
                 num_reqs = len(seq_lens)
             pool.prefetch_low_ratio_extra_layer(
                 layer_id,
+                # 读集合：indexer 为每个 query 选中的压缩块（页号）
                 core.sparse_page_indices(ratio),
-                read_indices=read_indices,
-                num_reqs=num_reqs,
-                read_token_capacity=read_token_capacity,
-                cache_full_read=cache_full_read,
+                read_indices=read_indices,                 # 有 cache → 精确行
+                num_reqs=num_reqs,                         # C2 上界用
+                read_token_capacity=read_token_capacity,   # C2 上界用
+                cache_full_read=cache_full_read,           # 容量估算用
             )

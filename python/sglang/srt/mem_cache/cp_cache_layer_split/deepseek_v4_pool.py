@@ -467,6 +467,29 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
 
     @staticmethod
     def _pool_num_pages(pool) -> int:
+        """该池实际分配的【物理页数】= 选页掩码的长度，也是上界的天花板。
+
+        不是"序列长度 / 页大小"，而是池子真实占了多少页：
+            size             该池的 token 容量（swa_max_total_num_tokens 等）
+            page_size        物理页大小（SWA 池 = 调度器 page_size，本 fork 断言 256）
+            global_page_size 逻辑页大小（默认 = page_size；分页分配器按逻辑页预留）
+
+        ★ 为什么要 + 一个【逻辑页】再上取整：
+          分配器按逻辑页预留，最高 token 下标是 size + logical_ps − 1，
+          所以物理页数要按 size + logical_ps 上取整。
+          与池侧 _num_dsv4_physical_kv_pages 的口径一致：
+              ceil_div(size + logical_page_size, physical_page_size)
+
+        例：size = 1,048,576、ps = 256 → ceil((1048576+256)/256) = 4097。
+
+        两个用途：
+          ① build_active_pages_mask 的掩码长度 → 页号天然落在 [0, max_pages)，
+             与 idx // page_size 的取值域一致；
+          ② contiguous_request_page_capacity 末尾的 min(max_pages, …) →
+             上界不可能超过池总页数。
+
+        没有 global_page_size 的其它池类型走下面那支保守公式（多给 1 个页的余量）。
+        """
         if hasattr(pool, "global_page_size"):
             return (
                 pool.size + pool.global_page_size + pool.page_size - 1

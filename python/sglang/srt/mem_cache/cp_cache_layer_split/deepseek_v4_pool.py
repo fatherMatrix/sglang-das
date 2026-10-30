@@ -809,6 +809,36 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         #   其中的 static_size 就是静态选页的上界：
         #     有值 → nonzero_static，输出长度主机已知
         #     None → nonzero，长度要读回设备（一次 D2H）
+        #
+        # ★★★ 为什么"读哪些页"能跨层复用（这是理解整个 LS 读路径的关键）
+        #
+        #   一句话：**编号层无关，内容层相关**。
+        #
+        #   ① 40 层的 buffer 是【同构的独立数组】（_create_buffers 里
+        #      `[create_buffer(num_pages) for _ in range(layer_num)]`）：
+        #      形状、page_size、页内布局全都一样，只是各占一块显存。
+        #   ② token → slot 的映射只有【每 rank 一份】（full_to_swa_index_mapping），
+        #      不是每层一份；slot // page_size 又给出页号。
+        #      所以同一个 token 在 40 层里拿到的 slot/页号是【同一个数】。
+        #   ③ 由此：
+        #        token t → slot s → 页 p
+        #          layer0 的 buf_0[s]  = KV_0(t)   ┐ 40 块不同显存，
+        #          layer1 的 buf_1[s]  = KV_1(t)   │ 内容各不相同，
+        #          …                               │ 但【下标都是 s】
+        #          layer39的 buf_39[s] = KV_39(t)  ┘
+        #
+        #   类比：40 本同版式的书。"我要第 3、7、12 页"这句话对每本都成立
+        #   （页号与书无关），但读出来的内容 40 本各不相同（内容与书有关）。
+        #
+        #   ⇒ 所以：
+        #       selected_pages（清单）  与层无关 → 可缓存，40 层共用一次 all-reduce
+        #       staging（内容）          与层相关 → 每层重拷（index_select 换 buffer）
+        #   这也是 DSV4AttnMetadata 只需要【一份】swa_page_indices 的原因：
+        #   如果编号随层漂移，page_table / swa_page_indices / swa_out_cache_loc
+        #   都得做成 40 份，元数据与图捕获都不可能成立。
+        #
+        #   ★ LayerSplit 下更关键：各 rank 只持有部分层的 buffer，但编号空间仍
+        #     共享 —— 否则第 1 轮 all-reduce 里大家说的"第 3 页"就不是同一个东西。
         if swa_cache.selected_pages is None:
             static_size = None
             # 四道门，任一不成立就退回动态 nonzero（多一次 D2H 同步）。

@@ -2445,10 +2445,42 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         positions: torch.Tensor,
         q: Optional[torch.Tensor] = None,
     ) -> None:
-        """q ([B, H, head_dim]): rope its query heads in the same launch."""
+        """把 kv 做 RMSNorm + RoPE 后写进本层 SWA 池的指定行。
+
+        ★ "写 KV cache"这个动作由【三个参数】共同确定，缺一不可：
+            kv        = 要写【什么】  [T_local 或 T_global, 576] 的原始值（未 norm/未 rope）
+            kvcache   = 写到【哪块 buffer】——本层在 SWA 池里的那一整块
+                        = swa_kv_pool.kv_buffer[_swa_local_layer_id(layer_id)]
+                        形状 [num_slots, 576]；它只是【基址】，不是"整块都写"
+            swa_loc   = 写到【哪几行】    [T] 的 slot 号
+                        最终效果：kvcache[swa_loc[i]] = rope(norm(kv[i]))
+
+        所以"传了 kvcache"不等于"整块 cache 被覆盖"——只有 swa_loc 指到的那些行
+        会被写；其余行保持原样（可能是别的请求的 KV，或空闲）。
+
+        ★ 下面三支写的是【同一块内存】，只是显式程度不同（按池格式分流）：
+            ① HCU + bf16 attn KV → set_key_buffer_fused(local_layer_id, swa_loc, kv)
+               buffer 与行号都隐式/半隐式：内部按 layer_id 取 kv_buffer[i]
+            ② uniform_fp8        → get_key_buffer(local_layer_id) 显式取出 buffer
+            ③ 其余（FlashMLA 分页）→ get_swa_raw_buffer(layer_id) 显式取出 buffer
+        三者最终都是 `buffer[slot] = 值`，差别只在量化格式与是否分两次 launch。
+
+        ★ 命名坑（同一个东西三个名字）：
+            get_swa_raw_buffer(layer_id)  ==  self.swa_kv_pool.kv_buffer[local_id]
+            函数名里的 swa_key_buffer     ==  参数名里的 kvcache
+            而 self.swa_kv_pool 是 DeepSeekV4SingleKVPool（一个 KVCache），
+            它内部再按 layers_mapping 分 swa_kv_pool / full_kv_pool —— 名字套娃。
+
+        ★ 这块 buffer 就是"SWA 家族"：压缩 KV 在 self.kv_pools[ratio]，
+          index-K 在 indexer 自己的 buffer，三者互不相干（见类 docstring）。
+
+        q ([B, H, head_dim]): rope its query heads in the same launch.
+        """
         if _is_hcu and self.is_bf16_attention_kv_cache:
             # Uniform-FP8 (trtllm-gen): in-place norm + RoPE (kv is not read again),
             # then an e4m3 cast + scatter with per-tensor scale 1.0.
+            # ↑ 两步：先在原地把 kv 改成 norm+rope 后的值（此后再也没人读原始 kv，
+            #   所以 in-place 安全），再 cast+scatter 到池里。
             from sglang.kernels.ops.attention.deepseek_v4_rope import (
                 fused_norm_rope_inplace_triton,
             )
@@ -2460,12 +2492,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 freqs_cis,
                 positions=positions,
             )
+            # 目标 buffer 由 local_layer_id 隐式确定；swa_loc 决定写哪几行
             self.swa_kv_pool.set_key_buffer_fused(
                 self._swa_local_layer_id(layer_id), swa_loc, kv
             )
             return
         if self.uniform_fp8:
             assert q is None, "uniform FP8 store does not fuse query RoPE"
+            # 一次 launch 完成 norm + rope + fp8 量化 + scatter；
+            # 目标 buffer 作为【第 7 个参数】显式传入
             fused_k_norm_rope_uniform_fp8(
                 kv,
                 kv_weight,
@@ -2476,14 +2511,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
             )
             return
+        # 通用分页（FlashMLA 布局）：out_loc 是行号，kvcache 是基址，
+        # page_size / layout 决定"行号 → 页内偏移"的换算
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
             eps=eps,
             freqs_cis=freqs_cis,
             positions=positions,
-            out_loc=swa_loc,
-            kvcache=self.get_swa_raw_buffer(layer_id),
+            out_loc=swa_loc,                              # 目标行号 [T]
+            kvcache=self.get_swa_raw_buffer(layer_id),     # 目标基址 [slots, 576]
             page_size=self.swa_page_size,
             layout=self.kv_layout,
             q=q,

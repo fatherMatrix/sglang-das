@@ -2746,6 +2746,28 @@ class MQALayer(MqaAttentionBase):
             #
             #   两者内部都会先算页集合并集（第 1 轮），再拷贝广播（第 2 轮）；
             #   静态选页只影响第 1 轮里"如何取出页号"这一步。
+            # ── pool 的实际类型（这个分支里是确定的）──────────────────────
+            #   get_token_to_kv_pool() → get_attn_backend().token_to_kv_pool
+            #   构造处（kv_cache_configurator.py:1737/1750）：
+            #     pool_cls = DeepSeekV4TokenToKVPool
+            #     if parallel.enable_cp_cache_layer_split and not is_draft_worker:
+            #         pool_cls = CpCacheLayerSplitDeepSeekV4TokenToKVPool   ← LS
+            #   ★ 能进本分支，说明 layer_split_prefill 为真，而它要求
+            #       is_cp_cache_layer_split_deepseek_v4_pool(pool)
+            #       = isinstance(pool, CpCacheLayerSplitDeepSeekV4TokenToKVPool)
+            #     所以【这里 pool 必然是 LS 子类】，不可能是基类。
+            #     （基类只在"没开 LS"或"DSpark draft worker"时出现，
+            #      而 is_draft_worker 侧根本不会有 LS 的预取）
+            #
+            #   LS 子类 ≈ 基类 + 两个改写的维度：
+            #     · 只为 owned 的连续层分配 buffer（约 1/stage 层数）
+            #     · 读非 owned 层时把 staging 当"伪 buffer"（get_*_buffer 内部重映射）
+            #   内部子池两者同构：
+            #     pool.swa_kv_pool      : DeepSeekV4SingleKVPool
+            #                             （若池是 uniform fp8 → DeepSeekV4UniformFP8KVPool）
+            #     pool.kv_pools[ratio]  : dict[int, Optional[DeepSeekV4SingleKVPool]]
+            #                             V4.1 只有 {1, 2} 两个家族
+            #     indexer 的 K          : 单独 buffer，按 rank 复制（不参与层分片）
             pool = get_token_to_kv_pool()
             # 【先发起】两个预取：调用次序固定（先 swa 后 extra），
             #   且所有 rank 同序 —— 它们是集合通信，不能有人跳过

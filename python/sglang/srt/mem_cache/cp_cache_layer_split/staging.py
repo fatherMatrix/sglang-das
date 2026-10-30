@@ -165,6 +165,43 @@ def remap_indices_to_staging(
     max_pages: int,
     static_selected_pages: bool = False,
 ) -> torch.Tensor:
+    """把"全局池里的 token 下标"翻译成"staging 里的紧凑下标"。
+
+    ── 它解决的是"地址换了"的问题 ────────────────────────────────
+      第 2 轮里 owner 只把【选中的那几页】紧凑拷进 staging：
+          staging 第 0 页 = 池里 selected_pages[0] 那一页
+          staging 第 1 页 = 池里 selected_pages[1] 那一页  ...
+      于是"池页号"与"staging 页号"不是同一个数，读者手里的 indices
+      （池内 token 下标）必须整体改写一遍，否则会读错行。
+
+    ── 输入 / 输出 ─────────────────────────────────────────────
+      indices                [N]  要读的 token 在【池】里的下标（槽号）
+      selected_pages         [K]  第 1 轮选出的页号（顺序 = staging 的页序）
+      page_size                   一页多少 token
+      max_pages                   池的总页数（= 掩码长度）
+      static_selected_pages       选页是否用了 nonzero_static（尾部含 -1 填充槽）
+      → 返回                  [N]  同一批 token 在【staging】里的下标；
+                                  所在页没被选中的 token 得到【负值】（kernel 跳过）
+
+    ── 算法（三步）─────────────────────────────────────────────
+      ① 建逆映射  page_map[池页号] = staging 页序号
+      ② 拆下标    page = idx // ps，off = idx % ps
+      ③ 重拼      new = page_map[page] * ps + off
+
+    ── 例子（ps=4, max_pages=8, selected_pages=[2,5]）─────────────
+      page_map = [-1, -1,  0, -1, -1,  1, -1, -1]   ← 池页2→staging页0，池页5→页1
+      indices  = [ 9, 10, 11, 21, -1, 13]
+      remapped = [ 1,  2,  3,  5, -1, -3]
+                   └─ 池页2 的 token 9..11 → staging 页0 的第 1..3 行
+                                 ↑        ↑   └ 池页3 未被选中 ⇒ 负值
+                          池页5 的 21   indices 的 -1 原样保留
+
+      ★ 未选中的页给出的是【负值】而不是恰好 -1：
+        page_map[page] = -1 ⇒ new = -ps + off ∈ [-ps, -1]，恒负 ⇒ kernel 一律跳过。
+    """
+    # ── HCU：整段交给 LightOp 融合核（commit 0c8baedbfa）──────────
+    #   语义完全等价，只是把下面三步合成一个 HIP kernel；
+    #   torch.compile 在 HCU 上也是关掉的（disable=_is_hcu）。
     if _is_hcu:
         from lightop.attention import dsv41_remap_indices_to_staging
 
@@ -172,7 +209,13 @@ def remap_indices_to_staging(
             indices, selected_pages, page_size, max_pages, static_selected_pages
         )
 
+    # ── ① 建逆映射 page_map：池页号 → staging 页序号 ───────────────
     if static_selected_pages:
+        # 静态选页：selected_pages 尾部有 -1 填充槽。
+        # 这些 -1 绝不能直接当下标 —— 会写到 page_map[-1]（= 最后一个真实槽），
+        # 把某个真实页的映射覆盖掉（静默读错页）。
+        # 做法：把 -1 引到 [max_pages, max_pages + n) 这段【额外槽】，
+        #      并把 page_map 相应加长；真实页仍写 [0, max_pages)。
         selected_valid = selected_pages >= 0
         selected_slots = torch.where(
             selected_valid,
@@ -189,19 +232,22 @@ def remap_indices_to_staging(
             device=indices.device,
         )
     else:
+        # 动态选页：selected_pages 全是真实页号，直接当 [0, max_pages) 的下标
         selected_slots = selected_pages.to(torch.long)
         page_map = torch.full((max_pages,), -1, dtype=torch.int32, device=indices.device)
+    # 第 i 个被选中的页 → staging 第 i 页；没被选中的页保持 -1
     page_map[selected_slots] = torch.arange(
         selected_pages.numel(), dtype=torch.int32, device=indices.device
     )
 
-    valid = indices >= 0
-    safe_indices = torch.clamp(indices, min=0)
-    page_ids = torch.div(safe_indices, page_size, rounding_mode="floor")
-    offsets = safe_indices - page_ids * page_size
-    new_pages = page_map[page_ids.to(torch.long)].to(indices.dtype)
-    remapped = new_pages * page_size + offsets
-    return torch.where(valid, remapped, indices)
+    # ── ②③ 拆下标 → 换页 → 重拼 ──────────────────────────────────
+    valid = indices >= 0                    # indices 里的 -1（无效行 / CP padding）要原样保留
+    safe_indices = torch.clamp(indices, min=0)   # 防负下标；-1 最终由下面的 where 还原
+    page_ids = torch.div(safe_indices, page_size, rounding_mode="floor")  # 池页号
+    offsets = safe_indices - page_ids * page_size                        # 页内偏移
+    new_pages = page_map[page_ids.to(torch.long)].to(indices.dtype)      # 池页号 → staging 页序号（未选中 = -1）
+    remapped = new_pages * page_size + offsets   # 重拼成 staging 下标；new_pages=-1 时结果恒负
+    return torch.where(valid, remapped, indices)  # 无效行还原成原来的 -1
 
 
 @torch.compile(dynamic=True)

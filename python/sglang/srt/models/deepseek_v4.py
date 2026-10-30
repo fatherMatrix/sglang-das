@@ -2766,6 +2766,53 @@ class MQALayer(MqaAttentionBase):
         # 【块 5】LS 预取能否与 Q 投影重叠（仅 HCU + V4.1 + CP 生效 + C1/C2 层 + 非图捕获）：
         #   为真 → 预取在 _forward_prepare 内部就发起，主流继续算 Q（真正的重叠）
         #   为假 → 预取推迟到块 8 之前，紧接着就要等待，等于串行
+        #
+        # ==================================================================
+        # 引入 patch：PR #549「Dsv4.1 prefill」，commit 9c15817821，
+        #             其中第 2 个提交 43a481e66e 就是本项
+        #   PR 动机原文：\"LayerSplit 虽然使用独立广播流，但 Q 投影顺序及主流上的
+        #                Extra 页选择通信仍限制计算与通信重叠。\"
+        #   改动要点：
+        #     · 把目标路径的 Q-B 投影【延后】到 KV 预取提交之后，腾出计算窗口
+        #     · 把静态 Extra 页选择 + AllReduce + owner 拷贝 + 广播 + remap
+        #       整链放到已有的旁路 stream
+        #     · 新增 slot 状态参数，避免重复进入广播 slot
+        #     · 保留 consumer 等待与 staging 生命周期管理，维持 collective 顺序
+        #     · 保留动态选页 / CUDA capture 等原路径
+        #   实测（32K，顺序 A/B 小样本）：主 step −1.40%、请求中位耗时 −1.25%，
+        #     \"每步与重计算重叠的 SWA 广播数\" 0/40 → 38/40。
+        #     38 = ratio 1/2 的层数；L0/L1（ratio 0）不在内，仍走块 8 串行。
+        #
+        # ==================================================================
+        # 三处代码配合，缺一处就不成立
+        # ==================================================================
+        #   ① _forward_prepare 里：非 overlap 才在常规位置算 Q
+        #        （:2270 `elif not overlap_layer_split_prefetch: q = _compute_q_b(...)`）
+        #   ② _forward_prepare 末尾：overlap 时先发起两个 prefetch，再算 Q
+        #        （:2402 先 maybe_prefetch_cp_kv_swa / _extra，然后 _compute_q_b）
+        #        ★ 顺序必须"先 swa 后 extra"，且所有 rank 同序 —— 集合通信
+        #   ③ 块 8：非 overlap 才在这里补发起，然后无条件 wait
+        #        （:2865 `if not overlap_layer_split_prefetch: maybe_prefetch_*`）
+        #        ★ 非 owned 层若没先 prefetch 过，池会直接抛异常
+        #          （_raise_for_missing_non_owned_prefetch）—— 这不是可选优化
+        #
+        # 八个条件逐个看：
+        #   _is_hcu                 这条路径依赖 HCU 的池/广播实现
+        #                           （pynccl + staging + 旁路流槽位），且只有 HCU 有 LS
+        #   self.is_dsv41           只有 V4.1 的 prepare 结构能安全地把 Q 投影延后
+        #                           （V4 Pro 的 q/kv 依赖顺序不同）
+        #   layer_split_prefill     池是 LS 池 + 本批是 CP extend，否则没有预取可发起
+        #   compress_ratio in (1,2) 这两类层才有 C1/C2 的 extra KV 要借；
+        #                           ratio 0 层被排除，故 38/40 而非 40/40
+        #   self.dsa_enable_prefill_cp   静态开关（构造期定）
+        #   dsa_use_prefill_cp(fb)       本批是否真的走 prefill CP（运行时）
+        #   not unified             unified 路径在 attention 之后才写 ring，
+        #                           且 unified_fp8_prefill 本身要求非多流 → 与 LS 互斥
+        #   not is_in_breakable_cuda_graph()
+        #                           BCG 内执行顺序固定、旁路流槽位管理受限，不能这样重排
+        #
+        # 与静态选页（C2）的关系：Extra 异步链复用 SGLANG_HCU_OPT_LAYERSPLIT_STATIC_PAGES，
+        #   但把它设成 0 只会关掉静态 nonzero，【不会撤销 Q 投影重排】——两者可独立开关。
         overlap_layer_split_prefetch = (
             _is_hcu
             and self.is_dsv41

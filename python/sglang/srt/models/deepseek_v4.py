@@ -2395,6 +2395,44 @@ class MQALayer(MqaAttentionBase):
         # 【块 2】非融合路径：逐段做投影 / norm / RoPE，KV 可能留给 backend 在
         #   attention 时统一写（此时返回值 kv 非 None）。
         else:
+            # ==============================================================
+            # 【块 2】对应的公式：Q 侧的【上投影 / decompression】
+            # ==============================================================
+            #   块 1/块 2 之前已经算完的是【下投影】（VAE 式的低秩压缩）：
+            #       q_a = x · W_aq^T     W_aq ∈ R^{r×d},  r = q_lora_rank = 1280
+            #   这里开始把它【展开】回 per-head 空间：
+            #
+            #   ① norm（作用在 rank 维 r 上，per token）
+            #        q̃_a = RMSNorm_{γ_q}(q_a) = q_a / sqrt(mean(q_a²)+ε) ⊙ γ_q
+            #      代码：self.q_norm = RMSNorm(q_lora_rank) → _normalize_q_lora
+            #      返回两个值：
+            #        q_lora     = bf16 的 q̃_a  ← 给 indexer 打分用（要原始精度）
+            #        q_for_wqb  = 量化后的 q̃_a ← 给 wq_b 的 GEMM 用（fp8/int8）
+            #      ★ 为什么要两份：indexer 要 bf16 的隐藏态算相似度，
+            #        而 wq_b 是量化 GEMM，吃的是 fp8/int8 操作数。
+            #        HCU 上这两件事在同一个 launch 里做
+            #        （rms_norm_fp8_operand / rms_norm_int8_operand）。
+            #
+            #   ② 上投影（这就是 W_b，与下投影不是同一个矩阵）
+            #        q = q_for_wqb · W_b^T   W_b ∈ R^{(n_h·h)×r},  h = 576
+            #        q → view [T, n_h, h]    每头 576 = q_nope 512 + q_pe 64
+            #
+            #   ③ RoPE（只作用在最后 qk_rope_head_dim = 64 维）
+            #        q[:, :, -64:] ← RoPE(q[:, :, -64:], positions)
+            #      若 self.q_head_norm：每 head 先做 RMSNorm(576) 再 RoPE
+            #        （fused_q_norm_rope 一个 kernel 做完）
+            #
+            #   ★ 注意：KV 侧【没有】上投影。MLA 的压缩 KV 本身就是最终表示：
+            #        kv [T, 576] = [ c_KV 512 | k_pe 64 ]
+            #        · K 的 nope 部分 ≡ c_KV，不展开
+            #        · V ≡ c_KV（同一份；num_key_value_heads == 1）
+            #        · 只有 k_pe 那 64 维要 RoPE
+            #      所以 _compute_kv_to_cache 里只有
+            #        rmsnorm(576) + RoPE(最后 64 维) + 写 cache，矩阵乘一步都没有。
+            #      真正的 W_UK / W_UV "上投影"被【吸收】进 attention/输出投影，
+            #      不在模型层出现 —— 这是 MLA 的全部意义：cache 只存 576 维，
+            #      而 Q 每层都要展开（不缓存，展开无存储代价）。
+            #
             # ── 先做 q 的 norm（q_norm + 可选量化），q_b 投影分三种走法 ──
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip and not _is_hcu:

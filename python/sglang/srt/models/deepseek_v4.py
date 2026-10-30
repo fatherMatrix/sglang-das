@@ -2473,6 +2473,27 @@ class MQALayer(MqaAttentionBase):
         #   · low_ratio_multi_stream ：C1/C2 层在支持多流的架构上的专门路径
         #   · 否则                    ：_forward_prepare（最通用，唯一带 LS 预取钩子的一条）
         #   两条多流路径都不带 unified_kv 分支，也不会发起 LS 预取。
+        #
+        # ★ HCU 上 V4.1 Flash 的【所有层】都落第三条，逐条对：
+        #     enable_multi_stream
+        #       · env / alt_streams        ✓（HCU 也有 5 条 alt_stream，见 use_stream_pool）
+        #       · get_is_capture_mode()    ✓ 仅捕获/重放期（这条决定了多流是"图内"优化）
+        #       · not is_cp_active(fb)     ✓（HCU 的 enable_cp_v2() 为 False → 该函数恒 False）
+        #       · self.compress_ratio not in (1,2)
+        #            → 只放行 ratio 0/4/128；V4.1 Flash 是 0/1/2
+        #       · not (_is_hip and self.compressor is None)
+        #            → HIP 上要求本层有 compressor；ratio 0 的纯 SWA 层没有 → 被排除
+        #          两条一起把 ratio 0 和 ratio 1/2 全挡住
+        #     low_ratio_multi_stream
+        #       · (_is_cuda and is_blackwell) or _is_gfx95_supported
+        #            → HCU 两者都不是 → 直接 False
+        #   ⇒ 只有 _forward_prepare 可选，而它恰好是唯一带 LS 预取钩子的那条。
+        #     也就是说：HCU 要 LayerSplit（省 KV 显存），就不能要这条多流重叠——
+        #     当前实现里两者互斥，这是设计取舍而不是遗漏。
+        #
+        # ★ 反过来看：即使在 CUDA/gfx95 上，多流也只在
+        #   get_is_capture_mode() 为真时启用（捕获期建立、重放期复用），
+        #   所以 eager prefill 走的还是 _forward_prepare。
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None

@@ -3836,11 +3836,32 @@ class DeepseekV4DecoderLayer(nn.Module):
         #      ATTN[i]→MOE[i]  → local_boundary（post_attention_layernorm）
         #      MOE[i]→ATTN[i+1]→ next_boundary （下一层的 input_layernorm）
         #      延迟到首次 forward 才做：accepts_mxfp8 要等权重加载完成才定。
+        # ── 侧流（把 H(X) 挪出关键路径）────────────────────────────────
+        # ★ 这段有两个独立判据，缺一不可，但代码把它们放在了两处：
+        #     ① 模式判据 mhc.use_stats_stream(cfg, fb, x)
+        #          = cfg.pre_from_prev
+        #            and decode_like（decode 或带 draft 的 target_verify）
+        #            and (not is_sm90 or x.shape[0]==1 or 1<x.shape[0]<=64)
+        #        ★ 它【只看模式，不看侧流是否存在】—— HCU 上这里会返回 True。
+        #     ② 流是否存在 self.hc_stats_stream
+        #          模型构造时才创建：
+        #            _is_cuda and (is_blackwell or is_sm90)
+        #            and SGLANG_OPT_USE_MULTI_STREAM_OVERLAP（默认 True）
+        #            and config.hc_pre_from_prev_sublayer
+        #        ★ HCU 上 _is_cuda 为假 ⇒ 恒为 None。
+        #
+        #   ⇒ HCU 上：①返回 True、②赋成 None，
+        #     于是 fork_stats_stream / mix_stats / _compute_triplet 里
+        #     所有 `if stats_stream is not None` 全部落空 → M 仍在主流程内联执行。
+        #     也就是说：这个 if 在 HCU 上"看起来进了"，实际是空转（等价于不做）。
+        #
+        #   为什么要有侧流：H(X) 只依赖 X_l、不依赖 y_l，而它要赶在 post 写回之前
+        #   完成；子层的执行时间就是可用的窗口（见 mhc 模块 docstring 的"带宽阶梯"）。
+        #   为什么只在 decode-like 开：extend 时子层本身很长，重叠收益被淹没，
+        #   而多一条流反而增加同步与显存占用。
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
-            stats_stream = self.hc_stats_stream
-            # 何时用独立流算 mixing 统计量（hc_pre 的 Sinkhorn 系数）：
-            # 大 batch 时把这段与主计算重叠；小 batch 反而更慢，所以有判据。
+            stats_stream = self.hc_stats_stream      # ← HCU 上这里是 None
 
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             """第一个子层：combine(pre) → 注意力 → post（并预算下一子层的 pre）。"""

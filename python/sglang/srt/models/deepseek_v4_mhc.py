@@ -715,6 +715,12 @@ def _combine(
     x_flat = x.flatten(1)
 
     if apply_pre is None:
+        # 只有【第一个子层】会走到这里：错位设计下"上一个 A"还不存在。
+        #   X_0 = hc_broadcast(e) 的 4 行【完全相同】，所以
+        #       A·X_0 = (Σ_k a_k)·e   —— 只是一个标量缩放
+        #   而 RMSNorm 对输入整体缩放不变，于是
+        #       norm(A·X_0) ≡ norm(e) = norm(X_0[:, 0, :])
+        #   完全等价，不是近似。省掉一次 4 行读 + 一次加权求和。
         return norm(x[:, 0, :])
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 

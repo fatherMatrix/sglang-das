@@ -1527,6 +1527,35 @@ class MQALayer(MqaAttentionBase):
     def _normalize_q_lora(
         self, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
+        """把 q_lora 做 RMSNorm，并【同时产出两份表示】。
+
+        数学（在 rank 维 r = q_lora_rank 上，per token）：
+            q̃ = q / sqrt(mean(q²) + ε) ⊙ γ_q          ← self.q_norm 就是 RMSNorm(r)
+
+        为什么必须两份：
+          · 第一份（bf16）给 **indexer** —— 它要拿原始精度的隐藏态算相似度/
+            打分，量化过的输入会让 top-k 选块偏移；
+          · 第二份（量化）给 **wq_b** —— 那是一个 fp8/int8 的量化 GEMM，
+            吃的是按 GEMM 后端要求的布局（如 FlashInfer 的 128x4 swizzle）。
+          两份在同一个 launch 里算出来，省一次遍历 q̃。
+
+        三条路径（谁命中看平台/后端）：
+          ① _is_hip（含 HCU）→ _hip.q_norm_for_wq_b，内部再分四种：
+               gfx95 fake-quant / HCU W8A8-FP8（rms_norm_fp8_operand）/
+               HCU W8A8-INT8·W4A8（rms_norm_int8_operand）/ 纯 bf16 norm
+             —— 该函数里对 wqkv_a 切片会先 .contiguous()：in-place 量化不能
+                写回别人的内存（q 可能是 wqkv_a[:, :r] 的视图）。
+          ② CUDA + V4.1 + Blackwell + 小批（≤8 行）→ rmsnorm_mxfp8
+             一个 Triton launch 出 (y_bf16, y_fp8, y_scale_swizzled)，
+             scale 按 FlashInfer 128x4 布局（buffer 大小 (k/32)*128，
+             行数被 padding 到 128）。
+             为什么不走大批：该 kernel 的 assert 是 0 < m ≤ 8 —— 只覆盖
+             decode / verify 的典型行数，prefill 走下面的兜底。
+          ③ 兜底 → q_norm(q)，返回 (q, q)
+             ★ 两个返回值是【同一个张量】的别名：下游若对第二份做 in-place
+               量化，会同时改掉 indexer 要读的第一份。这是"不量化"时的隐含
+               契约 —— 命中量化分支时才是两块独立内存。
+        """
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)

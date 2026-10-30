@@ -102,24 +102,46 @@ def contiguous_request_page_capacity(
       staging[:0] / pynccl broadcast(0 字节) 变得尴尬，所以至少给 1
       （拷贝侧另有 broadcast_pages = max(1, active_pages) 兜底）。
 
-    ★★ 这个前提会被 HiCache 的 load_back 打破（2026-10-26 起，devel 分支）：
+    ★★ 这个前提会被 HiCache 的 load_back 打破。骨架图：
 
-      恢复时 `_allocate_external_slots` 从空闲链整块取页（paged.py 的
-      alloc → free_pages[:n]），与请求已有前缀之间**没有续页语义**
-      （对比 alloc_extend 的 last_loc+1 续页）。于是同一个请求的 KV 变成
-      "L1 前缀一段 + 恢复块一段 + 后续 extend 一段 + 部分释放留下的空洞"。
+      页数由什么决定？不是"逻辑连续"，而是【物理槽有没有被切段】——
+      掩码里算的是 page = 物理slot // ps（见 build_active_pages_mask），
+      所以同一请求的槽一旦被切成多段，每个段边界都可能多占一个"半满页"。
 
-        页数仍然 = ceil(总 token 数/ps) + 半满页数；
-        而半满页数 ≈ 段数 D_r —— 不再受"每请求 ≤2"约束。
+      【正常】一个请求的 KV 在物理槽上是一段
+        物理槽:  |============ 一段 L ============|
+        页    :     |页a |页b |页c |          ← ⌈L/ps⌉ 个整页，最坏 +1（起点不对齐）
 
-      也就是说：使上界失效的不是"页号变散"（页号一直是散的，整页分配下无害），
-      而是**段数变多**。当真实活跃页数 > static_size 时，nonzero_static
-      只会保留前 static_size 个（静默截断、无断言），remap 把溢出页映射成 -1，
-      attention kernel 直接跳过 → 读到缺键的记忆。
+      【HiCache 回载后】同一请求被拆成 D_r 段（段与段之间夹着别的请求的页）
+        物理槽:  |-- 段1 --|      |--- 段2 ---|   |- 段3 -|
+        页    :   |页a|页b|      |页c|页d|页e|     |页f|
+                   ↑ 每个段边界都多出一个半满页
+        ⇒ 真实页数 ≈ ⌈L/ps⌉ + (D_r − 1)
 
-      这正是 HICACHE_IMPLEMENTATION.md §C.4 在组合期强制退动态 nonzero 的原因
-      （deepseek_v4_pool.py 的 _LS_HICACHE_BOUNDED_REPLAY 门控），
-      也是"段计数方案"要补的洞：把 D_r 记账并加进 extra_segments。
+      于是：
+        static_size（本函数）= ⌈total/ps⌉ + 2n      ← 只兜住"每请求 ≤2 段"
+        真实页数           ≈ ⌈total/ps⌉ + Σ D_r    ← HiCache 下 ΣD_r 可以 ≫ 2n
+                                    └──── 2n 不够 ⇒ 上界失效
+
+      失效后果（静默：无断言、无日志）：
+        真实活跃页数 > static_size
+          → torch.nonzero_static 只保留前 static_size 个（多出的页被无声丢弃）
+          → remap 把那些页映射成 -1
+          → attention kernel 跳过它们
+          → 读到"缺键"的记忆：结果错，但一切正常返回
+
+      ⇒ 使上界失效的不是"页号变散"（页号一直是散的；整页分配下无害），
+        而是【段数变多】。恢复时 _allocate_external_slots 从空闲链整块取页
+        （paged.py: alloc → free_pages[:n]），与已有前缀之间没有续页语义
+        （对比 alloc_extend 的 last_loc+1 续页），于是
+          "L1 前缀一段 + 恢复块一段 + 后续 extend 一段 + 部分释放的空洞"
+        这种形态就出现了。
+
+      修法（"段计数"）：把每个请求的 D_r 记账（alloc_extend / load_back /
+      free / evict 时更新），把上界改成 ⌈total/ps⌉ + Σ D_r。
+      在那之前，只能让这条组合强制退回动态 nonzero ——
+      即 HICACHE_IMPLEMENTATION.md §C.4 / deepseek_v4_pool.py 的
+      _LS_HICACHE_BOUNDED_REPLAY 门控。
     """
     if total_tokens == 0:
         return min(max_pages, 1)

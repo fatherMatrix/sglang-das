@@ -2056,10 +2056,57 @@ class MQALayer(MqaAttentionBase):
         #   fuse_wqa_wkv 时 wq_a 与 wkv 合成一个 GEMM，一次出两样：
         #     前 q_lora_rank 列 = q_lora，其余列 = kv（后面块 1/块 2 直接切）
         #   否则两次独立投影，qkv_a 置 None（后面按 kv is None 走另一支取 KV）
+        #
+        # ==================================================================
+        # 数学：MLA 的两条低秩投影，以及"融合"到底是什么
+        # ==================================================================
+        #   记号：x ∈ R^{T×d}（d = hidden = 5120）
+        #         r = q_lora_rank（Q 的低秩维）
+        #         h = head_dim = qk_nope_head_dim + qk_rope_head_dim
+        #                      = 512 + 64 = 576   （压缩 KV 的宽度：c_KV 512 + k_pe 64）
+        #
+        #   ① 不融合：两个独立矩阵、两次 GEMM
+        #        q_a = x · W_aq^T          W_aq ∈ R^{r×d}
+        #        kv  = x · W_akv^T         W_akv ∈ R^{h×d}
+        #
+        #   ② 融合：把两个权重【竖着拼】成一个矩阵，一次 GEMM
+        #        W_fused = [ W_aq ; W_akv ] ∈ R^{(r+h)×d}
+        #        x · W_fused^T = [ x·W_aq^T | x·W_akv^T ] = [ q_a | kv ]
+        #      ★ 数学上完全等价（分块矩阵乘法），拼接发生在【权重侧】，
+        #        是离线做的，forward 里看不出差别 —— 只少一次启动、少读一遍 x。
+        #
+        #   ③ 下游各自怎么用（形状串起来，以 V4.1 Flash 的 r=1280 为例）
+        #        qkv_a         [T, 1280+576=1856]
+        #        ├─ q_lora     [T, 1280]  = qkv_a[:, :1280]
+        #        │    → q_norm(1280) → 可选 fp8 量化 → wq_b
+        #        │    → q        [T, n_heads*576] → view [T, n_heads, 576]
+        #        └─ kv         [T, 576]   = qkv_a[:, 1280:]
+        #             → kv_norm(576) → 拆 [T,512] 的 c_KV 与 [T,64] 的 k_pe
+        #             （MLA：V 复用 c_KV，不单独投影；num_key_value_heads == 1）
+        #
+        #   ④ 收益
+        #        · 少一次 kernel 启动；
+        #        · x [T, d] bf16 只读一遍（两次 GEMM 各读一遍）：
+        #            T=8192 时 x ≈ 84 MB/层，40 层 ≈ 3.4 GB，按 3 TB/s ≈ 1 ms；
+        #        · 一次 GEMM 的 N=1856（vs 1280 / 576 两次），权重加载更连续。
+        #
+        #   ⑤ 代价（★ 这条最影响读代码）
+        #        融合后 kv 是 qkv_a 的【非连续切片】：stride = 1856，
+        #        而写 KV cache / all-gather / 压缩器都要求连续布局
+        #        → 后面到处出现的 kv.contiguous() 就是为它付的账。
+        #        不融合时 kv 是独立张量，本来就连续，不需要这次拷贝。
+        #
+        #   ⑥ 开关
+        #        SGLANG_OPT_FUSE_WQA_WKV 默认 True；构造参数 fuse_wqa_wkv
+        #        可逐层覆盖（见 MQALayer.__init__ 里 `fuse:` 的判定，
+        #        融合建 self.wqkv_a，否则建 self.wq_a + self.wkv）。
         if self.fuse_wqa_wkv:
+            # 一次 GEMM 出 [T, r+h]，这里只取前 r 列作 q_lora
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
+            # 独立投影：q_lora 自己算；kv 留到后面 wkv(x) 再算，
+            # 所以这里把 qkv_a 置 None，块 1/块 2 会走 `kv, _ = self.wkv(...)` 那一支
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 

@@ -2507,18 +2507,6 @@ class MQALayer(MqaAttentionBase):
                     forward_batch=forward_batch,
                 )
             elif use_cp:
-                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                attn_backend.store_cache(
-                    layer_id=self.layer_id,
-                    swa_k=kv,
-                    forward_batch=forward_batch,
-                )
-            elif use_cp:
                 # every rank writes the whole chunk's window KV with the fused fp32 store
                 # ↑ V4.1 + CP：不物化 bf16 中间态，直接走 fused fp32 store
                 #   （norm + RoPE + 写 SWA 缓冲一步完成），所以先把 kv 切出来：

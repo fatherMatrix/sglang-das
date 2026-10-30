@@ -104,6 +104,12 @@ def contiguous_request_page_capacity(
 
     ★★ 这个前提会被 HiCache 的 load_back 打破。骨架图：
 
+      ★★★ 一句话记住（理解整件事的关键）：
+              页数 ≈ ⌈总长 / page_size⌉ + 段数
+            正常每请求 1~2 段 → 2n 够用；
+            HiCache 回载后段数 D_r 变大 → 2n 不够 → 上界失效。
+            注意"段数"指【物理槽被切成几段】，不是逻辑 token 连续与否。
+
       页数由什么决定？不是"逻辑连续"，而是【物理槽有没有被切段】——
       掩码里算的是 page = 物理slot // ps（见 build_active_pages_mask），
       所以同一请求的槽一旦被切成多段，每个段边界都可能多占一个"半满页"。

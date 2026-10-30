@@ -2510,6 +2510,31 @@ class MQALayer(MqaAttentionBase):
                 # every rank writes the whole chunk's window KV with the fused fp32 store
                 # ↑ V4.1 + CP：不物化 bf16 中间态，直接走 fused fp32 store
                 #   （norm + RoPE + 写 SWA 缓冲一步完成），所以先把 kv 切出来：
+                # ★ 这两支是同一个公式的两面（fuse_wqa_wkv 开/关）：
+                #     kv = x_linear · W_akv^T        W_akv ∈ R^{576×d}
+                #   融合支：kv 是 [T, 1856] 输出的【后 576 列】切片
+                #   非融合：一次独立 GEMM 直接得 [T, 576]
+                #
+                #   四个维度对照：
+                #                     qkv_a[..., r:]        wkv(x_linear)
+                #     stride          (1856, 1) 非连续      (576, 1) 连续
+                #     是否视图        是（钉住整个 1856 缓冲） 否（独立内存）
+                #     GEMM 次数       已含在融合的那 1 次里    另算 1 次
+                #     额外拷贝         需要（见下面 contiguous） 不需要
+                #
+                #   ★ 因此紧跟的 kv.contiguous() 在两支里效果不同：
+                #       融合支 → 真的拷贝 T×576×2B（T=8192 时 ≈ 9 MB/层）
+                #       非融合 → **no-op**（contiguous() 对已连续张量直接返回自身）
+                #     换言之，那行 contiguous 是为融合支写的，wkv 支上纯属多余
+                #     （只多一次 dispatch，微秒级，无害）。
+                #
+                #   ★ 为什么这里不能复用 _compute_kv_bf16：
+                #     那个函数会顺手做 norm + RoPE（用【本地】positions），
+                #     而本支要求 gather 之后再用【全局】positions 做，
+                #     所以这里必须先拿到"裸"的 kv。
+                #
+                #   ★ 用 x_linear 而不是 x：与 wq_a/wqkv_a 保持一致，
+                #     保证融合/非融合两支吃同一个（可能已量化的）输入。
                 if qkv_a is not None:
                     kv = qkv_a[..., self.q_lora_rank :]
                 else:

@@ -69,11 +69,26 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
         #     3) 而本函数的调用点在 _forward_prepare（attention 之前），
         #        所以那一层的 prefetch 必然看到 None —— 顺序决定的，不是 bug：
         #          prepare(prefetch) → attention(建 cache)
-        #        V4.1 里第一个稀疏层是 L2（L0/L1 是 ratio 0 也会调本函数），
-        #        所以 L0/L1/L2 只能估上界，L3~L39 才能用精确行号。
+        #        在走稀疏 prefill 的平台上（NVIDIA），第一个稀疏层建的 cache
+        #        只对【它之后】的层可用。
         #
-        #   为什么精确值拿不到就退化成估计：swa_token_ids / flat_token_ids 是
-        #   随 workspace 一起算出来的；没有它就只能按 seq_lens 推上界（见下）。
+        # ★★ 但 HCU 上要特别注意：b 这条路走不到。
+        #    _forward_attention 里那条稀疏分支被 `if not _is_hcu:` 包着
+        #    （deepseek_v4_backend.py:6765），所以 Hygon 上永远不会调
+        #    _forward_prefill_sparse → 也就永远不在 attention 里建这个 cache。
+        #    ⇒ 除非 SGLANG_ENABLE_PREFILL_WAR_READ_DONE=1（默认 False，
+        #      此时由 prepare_prefill_shared_read_snapshot 提前建），
+        #      HCU 上【整个 forward 都是 None】。
+        #
+        #    由此推出两条实际覆盖差异（HCU + 默认配置 + 非尾段）：
+        #      · swa  ：cache=None → 走下面的 else 分支算出
+        #               Σmin(seq, extend+window-1)，num_reqs 也有
+        #               ⇒ static_size 仍可算，C2 静态选页【生效】（估得保守）
+        #      · extra：cache=None 且 tail=None → read_indices / read_token_capacity
+        #               / num_reqs 【全部为 None】→ 池里 static_size=None
+        #               ⇒ 退化成动态 torch.nonzero，C2 【不生效】
+        #      只有 bounded replay 的尾段（late_layer_tail 非 None）会给
+        #      extra 补上 Σceil(seq/ratio)，那时静态选页才回来。
         cache = getattr(metadata, "sparse_prefill_cache", None)
         read_token_capacity = None      # ← 给 C2 静态选页的上界（行数）
         num_reqs = cache.num_reqs if cache is not None else None

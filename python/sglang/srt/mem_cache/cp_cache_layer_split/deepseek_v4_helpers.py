@@ -123,6 +123,16 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
                 # 因为所有行的窗口都落在同一段尾段里，并集就【恰好等于尾段本身】，
                 # 不多不少 → Σtail_len 就是真实行数，不是上界。
                 # （上面的例子：seq=1000、extend=200 → tail_len=min(128,200)=128）
+                #
+                # ★ tail.extend_seq_lens_cpu 是什么：
+                #     类型 = Python list[int]（不是 tensor！），长度 = 请求数 bs，
+                #     每项 = 该请求的尾长 = min(SWA_WINDOW, extend_len)。
+                #     例 extend = 1000/200/50 → [128, 128, 50]，Σ = 306。
+                #   名字里之所以叫 "extend"：尾段是"用 tail_lens 当 extend 长度
+                #   重新跑一遍 init_forward_metadata_prefill"，所以沿用了
+                #   extend 那套字段名（同一个语义，不同的行集合）。
+                #   因为是 list，下面的 sum() 是纯 Python 整数相加 ——
+                #   不碰设备，零同步。（GPU 版是 tail.extend_seq_lens）
                 extend_lens = tail.extend_seq_lens_cpu
                 read_token_capacity = sum(extend_lens)
             else:

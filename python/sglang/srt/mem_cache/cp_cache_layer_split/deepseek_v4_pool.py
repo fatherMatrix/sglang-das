@@ -92,8 +92,19 @@ class _BatchActivePages:
     #   "selected_pages 尾部可能带 -1 填充槽，请按静态方式忽略它们"。
     #
     #   为什么挂在缓存对象上、而不是用局部变量：
-    #     选页每 batch 只做一次，结果缓存下来供 40 层复用；而它的三个消费点
-    #     都在【别的函数】里，拿不到 prefetch_*_layer 的局部 static_size：
+    #     选页结果的生命周期跨层（见下），而它的三个消费点都在【别的函数】里，
+    #     拿不到 prefetch_*_layer 的局部 static_size：
+    #
+    #     · swa  家族：`if swa_cache.selected_pages is None:` —— 【每 batch 一次】，
+    #       结果缓存给后续 39 层复用。成立的依据是"读集合与层无关"：
+    #       selected_pages 是池级页号，而 slot→page 的映射（page_table /
+    #       full_to_swa_index_mapping）由分配器统一给号，同一 token 在每层
+    #       buffer 里的 slot 号相同；各层不同的只是"从哪个 buffer 取"。
+    #       （主要收益：省掉 39 次 CP 组 all-reduce。）
+    #     · extra 家族：**每层重算**（各层 indexer 的 top-k 不同，Reuse 层还会
+    #       拷贝邻居的选择），只有 reuse_full_read（ratio==1 + full-history +
+    #       layer > source）时才整段复用 source 层的结果。
+    #     两者的消费点如下：
     #       ① prefetch_*_layer 里的 remap_indices_to_staging(..., flag)
     #            → 立即 remap：-1 必须落到 max_pages + arange 的"额外槽"
     #       ② _compact_broadcast_for_read(..., selected_pages_static=flag)

@@ -203,6 +203,17 @@ def active_pages_for_indices(
 
       填充槽（-1）由 remap_indices_to_staging 映射成越界哨兵，
       owner 侧拷贝时 clamp 成 0（重复拷 page 0，内容不会被读）。
+
+      ── 两个函数的输出对照（mask = [0,1,0,1,1,0]，真实非零 3 个）──────
+        torch.nonzero(mask)                      → [1, 3, 4]        形状 (3,)
+        torch.nonzero_static(mask, size=5,
+                             fill_value=-1)      → [1, 3, 4, -1, -1] 形状 (5,)
+        ★ 前 k 项【完全相同】，差别只在长度：
+            · nonzero         长度 = 真实个数 k —— 只有设备知道
+            · nonzero_static  长度 = 调用方传入的整数 —— 主机一开始就知道
+        ★ nonzero_static 不会多丢页，但它【不检查】size 是否够：
+          若 size=2 → [1, 3]，第 3 个页被静默丢掉（无断言、无日志）
+          ⇒ size 必须 ≥ 真实页数，这正是 static_size 上界要成立的原因
     """
     local_mask = build_active_pages_mask(indices, page_size, max_pages)
     local_mask = all_reduce_active_pages_mask(local_mask, pynccl_comm)

@@ -2643,37 +2643,73 @@ class MQALayer(MqaAttentionBase):
         #   · unified_kv（decode/prefill）          → 按池的 row stride 分配
         #   · 其他                                  → 可能按 kernel 头数 padding，
         #       被 padding 的头必须清零，否则脏数据会被注意力 kernel 读进去。
+        # ── 四个"出口"变量，先给默认值 ────────────────────────────────
+        #   tp_slice   默认 slice(None)：不切头（分支 1/2 都不需要切）
+        #   q_padded   只在"必须按 kernel 头数补头"时才非 None
+        #   q_out      真正喂给 attention 的 Q
+        #   q_rope     只有 unified 双池路径才有独立的 rope-Q
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
+        # K 的输出缓冲：只有 unified 的双源 kernel 会自己算/写 K；
+        # 常规路径下 K 由 attn_backend 写（块 6 返回的 kv 非 None 那种情形）
         k_nope, k_rope = None, None
+
+        # ── 分支 1：V4.1 + 池是统一 fp8 + 头数在特化集合内 → Q 直接产出 fp8 ──
+        #   四个条件各挡一种"不能直接按 fp8 分配"的情形：
+        #     is_dsv41              只有 V4.1 的 kernel 支持 fp8 的 Q
+        #     not q_head_norm       有 q_head_norm 时要先 norm 再量化，不能直接写 fp8
+        #     pool.uniform_fp8      池本身是 uniform fp8（KV 全是 fp8），Q 才配套
+        #     n_local_heads ∈ {8,16,32,64,128}
+        #                           这些是 kernel 的精确特化头数，其他头数会走 padding
+        #   收益：省一次 bf16→fp8 转换（Q 直接落成 fp8，不留 bf16 中间态）
         if (
             self.is_dsv41
             and not self.q_head_norm
             and get_token_to_kv_pool().uniform_fp8
             and self.n_local_heads in (8, 16, 32, 64, 128)
         ):
-            kernel_num_heads = self.n_local_heads
+            kernel_num_heads = self.n_local_heads          # 不做 padding
             q_out = torch.empty(
                 (x.shape[0], self.n_local_heads, self.head_dim),
-                dtype=torch.float8_e4m3fn,
+                dtype=torch.float8_e4m3fn,                 # ← 注意是 e4m3fn
                 device=x.device,
             )
+        # ── 分支 2：unified_kv（decode 单源 / prefill 双源）──────────────
+        #   Q 的形状与 dtype 必须【从池上取】，不能自己定。注释原话：
+        #     the kernel reads Q with the kv row stride, so the two must not drift
+        #   —— 那条 kernel 把 Q 当"与 KV 行同构"的张量来读，宽度/dtype 一漂移就读错。
         elif unified_fp8_decode or unified_fp8_prefill:
             # width and dtype come off the pools themselves; the kernel reads Q
             # with the kv row stride, so the two must not drift
             kv_pool = get_token_to_kv_pool()
+            # 双池的两半：latent 段（nope）与 rope 段分别取。
+            #   注意上面那句注释的意思：Q 的"每行宽度"和"dtype"都由池决定 ——
+            #   fp8 池的 nope 行是 512 B（448 latent + 14 scale + 50 pad），
+            #   kernel 按这个 stride 读 Q，自己另算一套就会错位。
             nope_pool = kv_pool.get_unified_kv(self.layer_id)
             rope_pool = kv_pool.get_unified_kv_rope(self.layer_id)
+            # new_empty 继承池的 dtype/device，宽度取池的行宽：
             q_out = nope_pool.new_empty(
                 (x.shape[0], self.n_local_heads, nope_pool.shape[-1])
             )
+            # rope 必须单独一份：two-pool 布局就是把它拆出去，
+            # 好处是 fp8 只作用在 latent 段、rope 保持高精度
             q_rope = rope_pool.new_empty(
                 (x.shape[0], self.n_local_heads, rope_pool.shape[-1])
             )
+            # prefill 的 2-source kernel 还要处理"本 chunk 的 K"（另一源是 paged 历史），
+            # 所以 K 的缓冲由这里出；decode 单源只读历史，不需要 K
             if unified_fp8_prefill or unified_fp8_verify:
                 k_nope = nope_pool.new_empty((x.shape[0], nope_pool.shape[-1]))
                 k_rope = rope_pool.new_empty((x.shape[0], rope_pool.shape[-1]))
+            # unified 路径不做 padding：kernel 的头数就是真实头数
             kernel_num_heads = self.n_local_heads
         else:
+            # ── 分支 3：常规路径（HCU 生产形态走这条）────────────────────
+            # 头数两种来源：
+            #   · HIP 且非 unified 且 _hip.skip_head_pad(self) 为真
+            #       该平台有"精确头数特化"的 kernel → 用真头数，完全不补头
+            #   · 否则 self._kernel_num_heads(x.shape[0])
+            #       按 backend 对该 batch 的要求取一个"支持的头数"（通常 ≥ 真头数）
             kernel_num_heads = (
                 self.n_local_heads
                 if _is_hip and not unified and _hip.skip_head_pad(self)
@@ -2682,9 +2718,16 @@ class MQALayer(MqaAttentionBase):
             if kernel_num_heads != self.n_local_heads:
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
+                # 走到这里 = 必须补头。补出来的头要不要清零，看"kernel 会不会读它们"。
                 if self.is_dsv41:
                     # V4.1 kernels read all padded heads, so the padding must be
                     # zero. The buffer is reused per layer; no consumer may keep it.
+                    # ↑ 三件事：
+                    #   ① V4.1 的 kernel 会读【全部】头（含 padding 位）→ 必须全零，
+                    #      否则脏数据/NaN 直接进注意力
+                    #   ② 这块缓冲【逐层复用】（挂在 attn_backend.forward_metadata 上），
+                    #      于是省掉每 forward 一次 memset
+                    #   ③ 也正因为复用，下游不能长期持有它 —— 下一层会覆盖同一块内存
                     want = (x.shape[0], kernel_num_heads, self.head_dim)
                     meta = getattr(attn_backend, "forward_metadata", None)
                     q_padded = getattr(meta, "q_pad_buffer", None)
@@ -2693,21 +2736,31 @@ class MQALayer(MqaAttentionBase):
                         or tuple(q_padded.shape) != want
                         or q_padded.dtype != x.dtype
                     ):
+                        # 形状/类型不符才重建；new_zeros 天然带清零
                         q_padded = x.new_zeros(*want)
                         if meta is not None:
                             try:
-                                meta.q_pad_buffer = q_padded
+                                meta.q_pad_buffer = q_padded      # 挂上去供下一层复用
                             except (AttributeError, TypeError):
-                                pass
+                                pass      # 元数据不可写（如 frozen struct）→ 放弃复用，只损失性能
                 elif _is_gfx942_supported or _is_hcu:
                     # Uninitialized padded TP heads inject NaN into attention on gfx942
                     # (fnuz), so zero-init there; other archs tolerate new_empty and skip
                     # the per-forward memset.
+                    # ↑ gfx942 与 HCU 都是 fnuz 语义：未初始化内存更容易被解释成 NaN，
+                    #   所以这两个平台必须清零。
                     q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
                 else:
+                    # 其他架构的 kernel 只读前 n_local_heads 个真实头，
+                    # padding 头脏了也无所谓 → new_empty，省掉 memset
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
+                # 给下游一个"只含真实头"的视图：写 Q 时写的是 q_padded 的前
+                # n_local_heads 列，padding 列保持刚清零的状态
                 tp_slice = slice(0, self.n_local_heads)
                 q_out = q_padded[:, tp_slice, :]
+        # attn_sink 也要按 kernel_num_heads 对齐（本 rank 的 sink 头切出来、多出来的补 0）
+        # —— 与上面"padding 头必须清零"是同一件事的两面：sink 是 logits 的偏置，
+        #    头数不一致就会加到错的头上。
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
         # 【块 5】LS 预取能否与 Q 投影重叠（仅 HCU + V4.1 + CP 生效 + C1/C2 层 + 非图捕获）：

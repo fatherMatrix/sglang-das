@@ -2010,6 +2010,33 @@ class MQALayer(MqaAttentionBase):
     #   ★ 压缩器在 CP 下读的是 all-gather 后的全序列（每个 rank 各写一份完整状态），
     #     这是"CP 不省 KV"的来源；真正省显存的是 LayerSplit。
     #     而 indexer 只算本地 query 行，才是 CP 提速的主要来源。
+    #
+    # ==================================================================
+    # 决策链（自上而下四层判断，每层减少一种可能）
+    # ==================================================================
+    #   ① q_a 投影：fuse_wqa_wkv ? 一次 GEMM 出 (q_lora, kv) : 两次独立投影
+    #        ↓
+    #   ② 形态开关：unified / fp8_2buff / is_decode
+    #      再由它们推出 fuse_verify、fuse_verify_fp8、fuse_prefill
+    #        ↓
+    #   ③ do_fused_qk_norm_rope = not layer_split_cp and (
+    #          (unified and (decode|verify|prefill)) or (非unified and 模型开关) )
+    #        · 真 → 块 1：一次 kernel 做 q_b + QK-norm + RoPE + （可选）写环
+    #        · 假 → 块 2：逐段做，KV 写入的归属再按 4 个子分支决定
+    #        ↓
+    #   ④ 出口 kv 的语义（决定 backend 写不写 KV）
+    #        kv 非 None → 还没写（或只写了半套），backend 在 attention 内按因果位置写
+    #        kv is None → 已写完，backend 跳过 store_cache
+    #
+    #   HCU 生产形态的典型路径：
+    #     fuse_wqa_wkv 视模型而定 → 非 unified → 模型开关 use_fused_qk_norm_rope 为真
+    #     → 块 1 融合 → single-card 时 kernel 自己写环 → kv=None
+    #     CP 时 use_cp 为真：非 unified 那一支会先把 KV all-gather 成全局序再写
+    #
+    #   ★ 一个容易混的点：块 1 里的"融合"与 PR 里说的"多流"是两件事。
+    #     块 1 = 把 q_b/QK-norm/RoPE/写环 合成一个 kernel（算子融合）；
+    #     多流 = 把 KV 写/压缩器放到旁路流与 Q 投影并行（调度重叠）。
+    #     HCU 拿到前者（use_fused_qk_norm_rope），拿不到后者（见块 2 判定）。
     def _forward_prepare(
         self,
         x: torch.Tensor,
@@ -2023,7 +2050,12 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
         overlap_layer_split_prefetch: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # ── 入参：x 是子层输入 [T, H]；x_quant 是上游已量化好的副本（可省一次量化）
         x_linear = x_quant if x_quant is not None else x
+        # ── q_a：先压到 q_lora_rank（V4 的 MLA 低秩投影）
+        #   fuse_wqa_wkv 时 wq_a 与 wkv 合成一个 GEMM，一次出两样：
+        #     前 q_lora_rank 列 = q_lora，其余列 = kv（后面块 1/块 2 直接切）
+        #   否则两次独立投影，qkv_a 置 None（后面按 kv is None 走另一支取 KV）
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -2031,6 +2063,9 @@ class MQALayer(MqaAttentionBase):
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
+        # ── 两个"这批是不是 CP"的判定，注意二者不同源：
+        #   use_cp         ：本批真的在做 CP（HCU 走 legacy DSA CP，非 HCU 走策略 CP）
+        #   layer_split_cp ：池是 LS 池 + 本批是 CP extend（= 要做跨 rank 借 KV）
         # HCU shards inputs through legacy DSA CP, not the generic CP strategy.
         use_cp = (
             dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
@@ -2039,6 +2074,7 @@ class MQALayer(MqaAttentionBase):
             is_cp_cache_layer_split_deepseek_v4_pool(get_token_to_kv_pool())
             and forward_batch.forward_mode.is_context_parallel_extend()
         )
+        # kv 的类型声明放这里：它在两条主路径里分别被赋成"待写"或 None
         kv: Optional[torch.Tensor]
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -2046,6 +2082,10 @@ class MQALayer(MqaAttentionBase):
             is_unified_kv_triton,
         )
 
+        # ── 三个"形态"开关，后面所有分支都由它们组合出来：
+        #   unified   ：是否走 unified_kv 池布局（env 默认关 → 典型 HCU 部署为 False）
+        #   fp8_2buff ：池是否 fp8 双缓冲（要求 unified + env + gfx95）
+        #   is_decode ：decode 或 idle（idle 指 DP-attention 里的空 rank）
         unified = is_unified_kv_triton()
         fp8_2buff = is_unified_kv_fp8()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
@@ -2085,6 +2125,14 @@ class MQALayer(MqaAttentionBase):
             and not is_decode
             and not forward_batch.forward_mode.is_target_verify()
         )
+        # ── 最终开关：走"融合"（块 1）还是"逐段"（块 2）。两个大前提：
+        #   ① not layer_split_cp
+        #        LS 下要借别的 rank 的 KV，融合 kernel 的"就地写本 rank 槽位"
+        #        语义不成立（写谁、写到哪都要靠 staging 决定）→ 必须先逐段
+        #   ② 二选一：
+        #      unified   → decode / verify / prefill 三种融合 arm 任一可用即可
+        #      非 unified → 看模型开关 self.use_fused_qk_norm_rope
+        #        （HCU 生产形态正是这一支：非 unified + 该开关为真 → 融合）
         do_fused_qk_norm_rope = not layer_split_cp and (
             (unified and (is_decode or fuse_verify or fuse_prefill))
             or (not unified and self.use_fused_qk_norm_rope)
@@ -2114,6 +2162,16 @@ class MQALayer(MqaAttentionBase):
 
             token_to_kv_pool = get_token_to_kv_pool()
             swa_rope_cache = None
+            # ── 下面 4 个 arm 只决定两件事（语义都是同一个 kernel 调用）：
+            #      · kernel 要不要【自己写环】（swa_cache/swa_loc 是否为 None）
+            #      · 写到哪、按什么行格式写（swa_page_size / bf16_store / fp8_2buff）
+            #   组合表：
+            #     unified + verify   → 不写环，只做 norm+RoPE，kv 交回 backend 写
+            #                          （因果掩码靠 backend 的 per-token index 流）
+            #     unified + prefill  → 不写环（本 chunk 是 extend 区，环由 backend 事后写）
+            #     unified + decode   → 写 unified 环（swa_loc 由 backend 每 forward 算一次）
+            #     非 unified         → 写普通 SWA 缓冲；CP 时本 rank 只有局部行，
+            #                          必须先 all-gather 成全局序才能落到全局槽位
             if unified and fuse_verify:
                 # Target-verify runs through the unified_kv decode path. The
                 # backend writes the current chunk's KV into the ring *before*
@@ -2202,14 +2260,21 @@ class MQALayer(MqaAttentionBase):
             # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
             # the backend do its normal causally-indexed store into the ring
             # before the decode kernel runs -- exactly as the unfused path did.
+            # ── 出口三选一：决定 kv 是否为 None（= 谁负责写 KV）
             if unified and (fuse_prefill or fuse_verify_fp8):
                 # The packed nope half rides out on the kv slot -- attention
                 # takes it as attn_k and save_kv_cache stays on so the backend
                 # does the ring write. Its rope half went to the caller's buffer,
                 # which has no second return slot here. Prefill's write lands
                 # after attention, verify's before it; both read this pair.
+                # ↑ 打包后的 nope 半借 kv 槽位带出去，rope 半在调用方缓冲里；
+                #   于是 kv 非 None → 调用方保持 save_kv_cache=True，
+                #   backend 按自己的时序把这一对写进环（prefill 在 attention 之后、
+                #   verify 在之前）。这里只有"一个返回槽"，所以只带 nope 半。
                 kv = k_nope_out
             elif not unified and use_cp:
+                # 非 unified + CP：本 rank 只握有局部行，
+                # 必须先 all-gather 回全局序，再让 backend 写（每 rank 各写一份）
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),
                     forward_batch,
@@ -2221,7 +2286,11 @@ class MQALayer(MqaAttentionBase):
                     forward_batch=forward_batch,
                 )
             elif not (unified and fuse_verify):
+                # 其余情形 kernel 自己已经把环写完（swa_cache/swa_loc 都非 None）
+                # → 返回 None，告诉 backend"别再写一遍"
                 kv = None
+            # 注：unified + verify（非 fp8）时三支都不进，kv 保持"待写"状态，
+            #     正是把"norm+RoPE 已做、环还没写"这件事交给 backend
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
@@ -2262,26 +2331,51 @@ class MQALayer(MqaAttentionBase):
         # 【块 2】非融合路径：逐段做投影 / norm / RoPE，KV 可能留给 backend 在
         #   attention 时统一写（此时返回值 kv 非 None）。
         else:
+            # ── 先做 q 的 norm（q_norm + 可选量化），q_b 投影分三种走法 ──
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip and not _is_hcu:
+                # gfx95 一类：把 q_b 投影、q norm、RoPE 交给 HIP 专用融合实现，
+                # 它内部自己决定要不要单独出 RoPE 结果（fuse_q_rope）
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
                     self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
                 )
             elif not overlap_layer_split_prefetch:
+                # 常规位置：这里就把 q_b 算完
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
                 fuse_q_rope = False
+            # ★ overlap_layer_split_prefetch 为真时，q_b【故意不在这里算】：
+            #   留到本函数末尾"先发起 LS 预取，再算 q_b"，用它的时间盖住集合通信。
+
+            # ── 接着决定"KV 谁来写"，4 个子分支 ────────────────────────
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
+                # ↑ 双源 kernel 把本 chunk 当 extend 区读，环由 backend 在
+                #   attention 之后写，所以这里只产出 bf16 kv 并带出去
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
                 if use_cp:
                     # 2-source attention reads the whole logical chunk.
+                    # ↑ CP 下本 rank 只有局部行，而 kernel 要读"整个逻辑 chunk"，
+                    #   所以先物化成全局序
                     kv = cp_materialize_global_token_order(
                         kv.contiguous(),
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
             elif use_cp and not self.is_dsv41:
+                # 非 V4.1 + CP：先 bf16 物化再 all-gather，然后 backend 写
+                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                kv = cp_materialize_global_token_order(
+                    kv.contiguous(),
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
+            elif use_cp:
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),
@@ -2295,15 +2389,23 @@ class MQALayer(MqaAttentionBase):
                 )
             elif use_cp:
                 # every rank writes the whole chunk's window KV with the fused fp32 store
+                # ↑ V4.1 + CP：不物化 bf16 中间态，直接走 fused fp32 store
+                #   （norm + RoPE + 写 SWA 缓冲一步完成），所以先把 kv 切出来：
                 if qkv_a is not None:
                     kv = qkv_a[..., self.q_lora_rank :]
                 else:
                     kv, _ = self.wkv(x_linear)
+                # CP 下每个 rank 都只算局部行，但【每个 rank 都要写整段窗口 KV】
+                # （各自维护一份完整副本）→ 先 all-gather 回全局序
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
+                # 位置也要用【全局】的：有了全序列才能算正确的 RoPE 相位。
+                # 尾段（bounded replay）时行是"每请求最后 128 行"，
+                # forward_batch.positions 的行序与 kv 不一致，所以优先用
+                # tail.pos_global（已按尾段行序排好）
                 tail = attn_backend.forward_metadata.late_layer_tail
                 global_positions = (
                     tail.pos_global
@@ -2319,8 +2421,12 @@ class MQALayer(MqaAttentionBase):
                     freqs_cis=self.freqs_cis,
                     positions=global_positions,
                 )
+                # 环已经写完 → 告诉 backend 不用再写
                 kv = None
             else:
+                # 最普通的一支（单卡 / 非 CP / 非 unified）：
+                # norm + RoPE + 就地写 KV 全在池的 store 里完成，
+                # 若 q_b 已顺带算过 RoPE（fuse_q_rope）就把 q 传进去复用
                 self._compute_kv_to_cache(
                     x_linear,
                     positions,
@@ -2338,9 +2444,13 @@ class MQALayer(MqaAttentionBase):
         #     · 压缩器：CP 下先 all-gather 成全序列再压缩，每 rank 各写一份完整状态
         #     · indexer：只对本地 query 行打分，随 CP 摊薄
         #   图捕获且 backend 支持低压缩比图时走 BCG 版本。
+        # 条件= ratio 是 1/2【且】本层至少有一个模块：
+        #   Full 层两者都有；Reindex 层只有 indexer；Reuse 层两个都没有 → 整段跳过
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
         ):
+            # BCG 分支的取舍：图内已有 low_ratio_prefill_graph 时，
+            # 说明这条链已经录进图里，不能再调 eager 版（否则图里图外两套顺序）
             if (
                 forward_batch.forward_mode.is_extend()
                 and is_in_breakable_cuda_graph()
@@ -2348,6 +2458,9 @@ class MQALayer(MqaAttentionBase):
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
+                # 统一入口：内部按是否 CP 分流
+                #   压缩器 → CP 下先 all-gather 成全序列再压缩，每 rank 各写一份
+                #   indexer → 只给本 rank 的 query 行打分（CP 下随行数摊薄）
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
                     x=x,
@@ -2414,10 +2527,19 @@ class MQALayer(MqaAttentionBase):
             #   两者内部都会先算页集合并集（第 1 轮），再拷贝广播（第 2 轮）；
             #   静态选页只影响第 1 轮里"如何取出页号"这一步。
             pool = get_token_to_kv_pool()
+            # 【先发起】两个预取：调用次序固定（先 swa 后 extra），
+            #   且所有 rank 同序 —— 它们是集合通信，不能有人跳过
             maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
             maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
+            # 【再算 q_b】这就是被挪过来的那段计算，用来盖住上面两轮的通信时间。
+            #   注意它和上面非 overlap 分支里那句是同一个调用，只是位置不同：
+            #   这里晚了，但正是这个"晚"腾出了重叠窗口。
             q = self._compute_q_b(q_for_wqb, positions, q_out)
 
+        # ── 返回 (q, kv)，kv 是"谁还没写 KV"的语义开关：
+        #     kv 非 None → 本函数没写（或只写了半套），attention backend 负责写
+        #                  调用方据此置 save_kv_cache=True，并把 kv 当 attn_k
+        #     kv is None → 环已经写完，backend 跳过自己的 store_cache
         return q, kv
 
     def forward(

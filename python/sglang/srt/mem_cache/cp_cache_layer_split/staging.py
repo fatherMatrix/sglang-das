@@ -84,6 +84,24 @@ def contiguous_request_page_capacity(
       调用方传进来的 total_tokens 已经按 min(seq_len, extend + window - 1)
       折算过，正是为了维持这个前提。
 
+    ── 三步推导 ────────────────────────────────────────────────
+      ① 单请求：读段 [S, S+L)，S 未必对齐页边界
+             跨页数 ≤ ⌈L / ps⌉ + 1
+      ② 求和  ：Σ⌈L_r / ps⌉ ≤ ⌈ΣL_r / ps⌉ + (n − 1)
+             （⌈a⌉ + ⌈b⌉ ≤ ⌈a+b⌉ + 1，n 项累积最多多 n−1）
+      ③ 合并  ：Σ(⌈L_r/ps⌉ + 1) ≤ ⌈total/ps⌉ + (n−1) + n
+                              = ⌈total/ps⌉ + 2n − 1 ≤ ⌈total/ps⌉ + 2n
+
+      例（ps = 256，3 个请求读段长 327 / 177 / 80）：
+            total = 584 → ⌈584/256⌉ = 3
+            capacity = 3 + 2×3 = 9
+            真实占页（各请求独立算）= 2 + 2 + 1 = 5   ⇒ 9 ≥ 5，余量 4
+
+    ── 空批为什么返回 1 ────────────────────────────────────────
+      total_tokens == 0 时上界可能算出 0，而 0 长度的张量会让下游
+      staging[:0] / pynccl broadcast(0 字节) 变得尴尬，所以至少给 1
+      （拷贝侧另有 broadcast_pages = max(1, active_pages) 兜底）。
+
     ★★ 这个前提会被 HiCache 的 load_back 打破（2026-10-26 起，devel 分支）：
 
       恢复时 `_allocate_external_slots` 从空闲链整块取页（paged.py 的

@@ -18,6 +18,21 @@ def build_active_pages_mask(
     page_size: int,
     max_pages: int,
 ) -> torch.Tensor:
+    """把"本 rank 要读的 token 下标"折成一张【定长页掩码】。
+
+    背景：LayerSplit 下本 rank 只持有 part 的层，读别的层的 KV 前要先知道
+    "要读哪些页"，再让 owner 把这些页搬过来。掩码就是这一步的中间表示。
+
+    为什么是"定长"：它要参与 all-reduce（集合通信），所有 rank 的缓冲形状
+    必须一致 → 长度恒为 max_pages（整池页数），与真实活跃页数无关。
+
+    细节：
+      · indices 里的 -1（无效行/padding）由 valid 掩掉；
+        clamp(min=0) 既避免负下标，又把它们统一指到 page 0（不会置位，因为
+        index_put_ 的值是 valid，-1 那格贡献 0）。
+      · accumulate=True：同一页被多个 token 命中会累加，所以值可能 >1。
+        后续只判"非零"（nonzero / all_reduce 求和），所以 >1 无害。
+    """
     local_mask = torch.zeros(max_pages, dtype=torch.int32, device=indices.device)
     valid = indices >= 0
     safe_indices = torch.clamp(indices, min=0)
@@ -31,7 +46,13 @@ def build_active_pages_mask(
 
 
 def all_reduce_active_pages_mask(local_mask: torch.Tensor, pynccl_comm) -> torch.Tensor:
-    """Sum the per-rank active-page mask across the attention-CP group."""
+    """第 1 轮集合通信：跨 attention-CP 组求【并集】。
+
+    用 sum 而不是 max 也能得到并集——因为后续只关心"是否非零"：
+      某页只要有任一 rank 命中，求和后就 >0；全都没命中才是 0。
+    ★ 这一步是所有 rank 都必须参与的集合通信（顺序固定、不可跳过），
+      也是"空批/空 rank 也要调用 prefetch"的原因。
+    """
     with pynccl_comm.change_state(enable=True):
         pynccl_comm.all_reduce(local_mask)
     return local_mask

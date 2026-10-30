@@ -2073,6 +2073,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
 
     def wait_layer_transfer(self, layer_id: int) -> None:
+        """等本层的 HiCache 回载（H2D）落地。
+
+        ★ 这是 HiCache 与 LayerSplit 唯一的数据面交汇点：
+          · 回载会把 host 上的 KV 写回【owner 的持久 buffer】；
+          · 而 LS 的第 2 轮广播正是从那份 buffer 里拷页；
+          · 不等 → 拷到的是"回载前"的旧内容（结果错但不报错）。
+        实现是层粒度的计数器（layer_transfer_counter），wait_until 只在
+        需要时才插事件等待，不阻塞主机。
+        """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 

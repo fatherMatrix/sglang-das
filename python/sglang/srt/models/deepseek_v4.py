@@ -2574,10 +2574,20 @@ class MQALayer(MqaAttentionBase):
                 #   参数逐个：
                 #     layer_id   全局层号；池内部会再映射成 _swa_local_layer_id
                 #                （PP / LayerSplit 分片后的本地层号）
-                #     swa_loc    目标槽位，来自 get_swa_out_cache_loc：
-                #                  ① request_window 模式 → 环形缓冲的 write_loc（不翻译）
-                #                  ② 普通 → metadata 里的 out_cache_loc
-                #                  ③ idle/空批 → 现场重翻译（旧元数据可能失效，写哑槽）
+                #     swa_loc    目标槽位，来自 get_swa_out_cache_loc。
+                #                ★ 它才是"global kv 落到哪"的答案：
+                #                  长度 = kv 行数，第 i 项 = 第 i 行该写进哪个槽，
+                #                  槽位属于【SWA 池】（不是 full 池）。
+                #                  行↔槽必须 1:1 对齐 —— 这正是"先 gather 成
+                #                  全局序"的原因：gather 前第 i 行的 token
+                #                  与 swa_loc[i] 指的 token 不是同一个。
+                #                三分支：
+                #                  ① request_window 模式 → 环形缓冲的 write_loc
+                #                     （请求私有 ring 行号，不属 full 池，不翻译）
+                #                  ② 尾段 → late_layer_tail.swa_out_cache_loc
+                #                     （只覆盖尾行，长度与整批 out_cache_loc 不同）
+                #                  ③ 普通 → core.swa_out_cache_loc（本 forward 预先
+                #                     翻译并缓存）或现场 translate_loc_from_full_to_swa
                 #     kv_weight  kv_norm 的 γ（.data 避开 autograd 记账）
                 #     eps        RMSNorm 的 ε
                 #     freqs_cis  RoPE 的 cos/sin 表（按位置索引）

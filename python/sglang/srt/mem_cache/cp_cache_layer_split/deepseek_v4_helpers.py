@@ -90,7 +90,15 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
         #      只有 bounded replay 的尾段（late_layer_tail 非 None）会给
         #      extra 补上 Σceil(seq/ratio)，那时静态选页才回来。
         cache = getattr(metadata, "sparse_prefill_cache", None)
-        read_token_capacity = None      # ← 给 静态选页的上界（行数）
+        # ★ 下面两个量的【唯一消费者】就是静态选页的上界：
+        #     read_token_capacity / num_reqs  →  contiguous_request_page_capacity
+        #                                     →  static_size → nonzero_static(size=…)
+        #   它们【不参与】"搬哪些页"的决定 —— 那是第 1 轮掩码（all_reduce 后的
+        #   实际并集）算出来的 selected_pages；也不参与 staging 越界检查
+        #   （那用的是 selected_pages.numel()）。
+        #   ⇒ 若把 SGLANG_HCU_OPT_LAYERSPLIT_STATIC_PAGES 关掉，这一段估算
+        #     仍然是死代码（照样执行，只是没人读），零设备成本。
+        read_token_capacity = None      # ← 静态选页的上界（行数）
         num_reqs = cache.num_reqs if cache is not None else None
         # ══════════════════════════════════════════════════════════════════
         # 这一段在算什么：「本批一共有多少个 token 的 KV 可能被读到」

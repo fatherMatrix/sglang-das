@@ -88,6 +88,24 @@ class _BatchActivePages:
 
     selected_pages: Optional[torch.Tensor] = None
     remapped: Optional[torch.Tensor] = None
+    # ★ 这次选页是不是"静态"（nonzero_static）—— 唯一作用是告诉下游：
+    #   "selected_pages 尾部可能带 -1 填充槽，请按静态方式忽略它们"。
+    #
+    #   为什么挂在缓存对象上、而不是用局部变量：
+    #     选页每 batch 只做一次，结果缓存下来供 40 层复用；而它的三个消费点
+    #     都在【别的函数】里，拿不到 prefetch_*_layer 的局部 static_size：
+    #       ① prefetch_*_layer 里的 remap_indices_to_staging(..., flag)
+    #            → 立即 remap：-1 必须落到 max_pages + arange 的"额外槽"
+    #       ② _compact_broadcast_for_read(..., selected_pages_static=flag)
+    #            → owner 拷贝：-1 clamp_min(0) 成 page 0（重复拷，不会被读）
+    #       ③ _remap_*_for_read(..., flag)
+    #            → attention 侧的延迟 remap（per-query 索引形状不同，第二次 remap）
+    #     三处对 -1 的处理各不相同，所以"是否静态"必须随缓存一起传下去。
+    #
+    #   重置：reset_batch_active_pages() 必须一并清成 False —— 否则下一批沿用
+    #   上一批的标志：动态批里本没有 -1，多开槽只是浪费；而静态批若被当成动态，
+    #   page_map[selected_pages] 里的 -1 会写到 page_map[-1]（最后一个真实槽）
+    #   → 覆盖真实映射 → 读到错页内容，且不报错。
     static_selected_pages: bool = False
 
 

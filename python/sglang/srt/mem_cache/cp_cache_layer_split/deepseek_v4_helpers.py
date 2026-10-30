@@ -155,11 +155,34 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
                 # ★ 为什么说它是"上界"：它假设每请求都能往前看满 W−1 个；
                 #   实际窗口可能因跨 rank / 尚未本地而略少。估大了只是多搬页
                 #   （安全方向）；估小了才会被 nonzero_static 静默截断。
+                #
+                # ── 三个请求的完整例子（W = 128）─────────────────────────
+                #   zip 的两边：seq_lens_cpu（每请求总长）与 extend_lens（每请求本次新增），
+                #   长度都等于请求数 bs，strict=True 保证不会悄悄错位。
+                #
+                #   请求   seq_len  extend  历史    本 chunk 窗口并集        贡献
+                #   ─────────────────────────────────────────────────────────
+                #    A      1000     200    800    [673, 999]           327
+                #         S = 800，下界 800-(128-1)=673 → 200+127 = 327
+                #    B      5000      50   4950    [4823, 4999]         177
+                #         S = 4950，下界 4950-127=4823 → 50+127 = 177
+                #    C        80      80      0    [0, 79]               80
+                #         S = 0，下界被 0 截断 → min(80, 80+127) = 80（取 seq）
+                #   ─────────────────────────────────────────────────────────
+                #   Σ = 327 + 177 + 80 = 584  ← read_token_capacity
+                #
+                #   为什么 min 恰好等价于"下界是否被 0 截断"：
+                #     chunk 起点 S = seq_len − extend_len
+                #     若 S ≥ W−1（即 seq_len ≥ extend+W−1）→ 并集 = extend + W − 1
+                #     否则下界被截到 0           → 并集 = seq_len
                 extend_lens = forward_batch.extend_seq_lens_cpu
                 read_token_capacity = sum(
                     min(seq_len, extend_len + pool.sliding_window - 1)
                     for seq_len, extend_len in zip(
-                        forward_batch.seq_lens_cpu.tolist(), extend_lens, strict=True
+                        # .tolist()：整段留在 CPU，避免任何设备参与
+                        forward_batch.seq_lens_cpu.tolist(),
+                        extend_lens,
+                        strict=True,
                     )
                 )
             # 静态上界公式 ceil(tokens/ps) + 2*num_reqs 需要【请求数】，

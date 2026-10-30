@@ -1042,6 +1042,23 @@ class MqaAttentionBase(nn.Module):
         else:
             wo_a_quant_config = None
 
+        # ★ 谁命中融合（构建 self.wqkv_a）、谁不命中（构建 wq_a + wkv）
+        #   开关只有两处：
+        #     · env  SGLANG_OPT_FUSE_WQA_WKV（environ.py，默认 True）
+        #     · 构造参数 fuse_wqa_wkv（None 时取 env；逐层可覆盖）
+        #   全仓唯一的显式覆盖是 DSpark 草稿层：
+        #     deepseek_v4_dspark.py:197  fuse_wqa_wkv=False
+        #   ⇒ HCU 的主模型层【没有】任何关闭它的代码，
+        #     所以走融合分支：一次 GEMM 出 [T, q_lora_rank+head_dim]。
+        #
+        # ★ 权重是"加载时合并"的：checkpoint 里仍是 wq_a / wkv 分开，
+        #   load_weights 用 cache_wqkv_a_weight 把同一层的 .wq_a.* 与 .wkv.*
+        #   扣在同一个 key 下（shard_key = "q"/"kv"），两者都到齐后调
+        #   _fuse_deepseek_v4_wqkv_a_pair → torch.cat([q, kv], dim=0)，
+        #   拼成 .wqkv_a.*（dim 0 = 输出维，即 [W_aq; W_akv]）。
+        #   GGUF 的 qweight_type 是个标量，合并前会校验两者类型一致。
+        #   量化权重同样处理（weight_scale_inv / weight_scale / qweight 都在
+        #   同一张表里按 dim 0 拼接，因为 scale 是 per-output-channel 的）。
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
 

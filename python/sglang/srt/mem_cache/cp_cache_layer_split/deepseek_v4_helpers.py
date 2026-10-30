@@ -50,10 +50,30 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
     if _should_sync_cp_cache_layer_split(pool, forward_batch):
         metadata = get_attn_backend().forward_metadata
         # sparse_prefill_cache：本 forward 的"稀疏 prefill 工作区"，
-        # 由【第一次】稀疏 attention 建出来，里面缓存了
-        #   · swa_token_ids           本批要读的 SWA 行号（精确）
-        #   · ensure_compressed(ratio) 每个压缩家族的 flat_token_ids
-        # 所以第一次走到这里时它是 None，只能按上界估（见下面两支）。
+        # 里面缓存了
+        #   · swa_token_ids            本批要读的 SWA 行号（精确）
+        #   · ensure_compressed(ratio)  每个压缩家族的 flat_token_ids
+        #
+        # ★ 它是【per-forward 懒建】的，所以确实存在"还没有"的层：
+        #     1) 生命周期：挂在 DSV4Metadata 上，每个 forward 由
+        #        init_forward_metadata 重新造一个（__post_init__ 置 None，
+        #        deepseek_v4_backend.py:1515/1549）→ 跨 forward 不保留。
+        #     2) 两个可能的创建时机：
+        #        a. forward 之前：prepare_prefill_shared_read_snapshot()
+        #           （model_runner.py:1730 / eager_runner.py:328）
+        #           —— 但只在 SGLANG_ENABLE_PREFILL_WAR_READ_DONE（默认 False）
+        #              + EXTEND + dflash family + 非策略CP 时才真造，
+        #              其余情况直接 return。
+        #        b. 【默认路径】第一层真正跑稀疏 attention 时，在
+        #           _forward_extend_sparse 内部造好并挂上（:6996-7001）。
+        #     3) 而本函数的调用点在 _forward_prepare（attention 之前），
+        #        所以那一层的 prefetch 必然看到 None —— 顺序决定的，不是 bug：
+        #          prepare(prefetch) → attention(建 cache)
+        #        V4.1 里第一个稀疏层是 L2（L0/L1 是 ratio 0 也会调本函数），
+        #        所以 L0/L1/L2 只能估上界，L3~L39 才能用精确行号。
+        #
+        #   为什么精确值拿不到就退化成估计：swa_token_ids / flat_token_ids 是
+        #   随 workspace 一起算出来的；没有它就只能按 seq_lens 推上界（见下）。
         cache = getattr(metadata, "sparse_prefill_cache", None)
         read_token_capacity = None      # ← 给 C2 静态选页的上界（行数）
         num_reqs = cache.num_reqs if cache is not None else None

@@ -1387,6 +1387,18 @@ class MQALayer(MqaAttentionBase):
             #   所以"同 ratio 有多个 index 源"并非冲突：每个 index 源会刷新它之后
             #   那一段 Reuse 层的选择（就近向上绑定最近的源，见池的 source_layer_of）。
             #
+            # ★ 这套共享省下什么（1M 上下文下的账，按 layer / entry 计）：
+            #     压缩 KV   38 个需压缩层各存一份 = 30.4M 条目
+            #               → 只 4 个 kv_source 存（ratio2 三份 + ratio1 一份）
+            #               = 2.62M 条目，省 11.6×
+            #     index-K   同上，38 份 → 4 份（只有 kv_source 有 wk/k_norm）
+            #     打分      38 层全池 = 124.6B MAC
+            #               → 8 个 index_source（4 全池 + 4 候选池）= 11.0B MAC，省 11.3×
+            #               其中两级检索单独贡献 27.9B → 11.0B（Reindex 只在
+            #               2048×8=16384 条候选里搜，成本与上下文长度无关）
+            #   一句话：省的是"每层各算一份、各存一份"的重复；
+            #   代价是 Reuse 层用【邻居算出的选择】，而不是自己算的。
+            #
             # ★ 晚层（ratio 0，既不是 kv 源也不是 index 源）同样读这份 buffer，
             #   这就是 enter_late_layer_tail 必须把 sparse 三件套按尾行拷过去的原因
             #   （见 deepseek_v4_backend.py 的六步说明）。

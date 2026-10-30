@@ -2513,6 +2513,26 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
+        # C1/C2（ratio 1/2）层的多流 prepare：把压缩器写 KV 与注意力计算重叠。
+        # 三道门，逐条看为什么：
+        #   ① 架构：(_is_cuda and is_blackwell) or is_gfx95_supported
+        #        —— 这条路径依赖这两个架构上的专用 kernel（写 KV 融进 K kernel /
+        #           旁路流上的压缩器）。HCU 是 HIP 的 gfx936/938/928，两个都不是
+        #           ⇒ 第一项就 False，整支短路。
+        #   ② 模式：只放行 decode / target_verify
+        #        —— prefill 走另一套 packed 路径（块 3 的 unified_fp8_prefill，
+        #           它还额外要求 not enable_multi_stream）；而且 prefill 的写 KV 量大、
+        #           Q 也长，重叠的收益与实现方式都不同。
+        #   ③ verify 分支额外查 GEMM 后端（注释：Other MXFP8 backends may share
+        #      mutable GEMM workspace）
+        #        —— 多流意味着两条流【并发】跑 GEMM；若后端复用同一块可变 workspace
+        #           就会互相踩。只有 FLASHINFER_CUTEDSL（以及 gfx95 的原生实现）
+        #           能保证可重入。
+        #        —— 为什么这条只在 verify 里查：decode 每请求 1 行，走的是 decode
+        #           GEMM，不共享 workspace；verify 有 k+1 行，走 dense MXFP8 GEMM，
+        #           才可能撞。
+        #   ⇒ HCU 上 ①③ 都不满足（非 gfx95、mxfp8 后端也不是 CUTEDSL），
+        #     所以 38 个 ratio 1/2 层同样落回 _forward_prepare。
         low_ratio_multi_stream = (
             ((_is_cuda and get_platform().is_blackwell) or _is_gfx95_supported)
             and self.compress_ratio in (1, 2)

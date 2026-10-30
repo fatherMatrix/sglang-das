@@ -61,6 +61,21 @@ the kernel dispatch.
 
     ⑤ 传给下一个子层：(R_{k+1}, pre_k)
 
+  ★ 与论文/文档（A.4.3）的边界编号对照，避免看代码时对不上：
+        文档把"子层 l-1 的 post"到"子层 l 的 combine"之间叫【边界 l】，
+        边界 l 上有三件事： (a) 写回 X_l  (b) H(X_l)  (c) A·X_l 混合
+        代码里 (a)(b) 挤在同一个函数（run_*_post）里，因为两者都在
+        "y_l 已经出来"之后才能做，所以下标会差一拍：
+
+          文档                       代码
+          (a)@边界 l  写回 X_l   ↔   run_post(l-1) 里的残差写回
+          (b)@边界 l  算 H(X_l)  ↔   run_post(l) 里的 _compute_triplet(R_l)
+          (c)@边界 l  混合 X_l   ↔   combine(l)，用 pre_{l-1}
+
+        注意 (b)@边界 l 在代码里落在 run_post(l)（即边界 l+1）—— 这不改变
+        语义（它只依赖 X_l），正是"H 离开关键路径"的实现：先让 (c) 用旧 A 跑，
+        新的 triplet 晚一拍再算。
+
   ★ 这个错位（pre_k 由 R_k 算出、却作用在 R_{k+1} 上）就是 single-pass mHC。
     它带来的收益只有一条，但很关键：② 不再依赖【本层】的 ①。
       没有错位（V4 Pro）：② 必须先拿到 pre_k，① 卡在关键路径上，

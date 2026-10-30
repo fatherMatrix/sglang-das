@@ -83,14 +83,14 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
         #    由此推出两条实际覆盖差异（HCU + 默认配置 + 非尾段）：
         #      · swa  ：cache=None → 走下面的 else 分支算出
         #               Σmin(seq, extend+window-1)，num_reqs 也有
-        #               ⇒ static_size 仍可算，C2 静态选页【生效】（估得保守）
+        #               ⇒ static_size 仍可算，静态选页【生效】（估得保守）
         #      · extra：cache=None 且 tail=None → read_indices / read_token_capacity
         #               / num_reqs 【全部为 None】→ 池里 static_size=None
-        #               ⇒ 退化成动态 torch.nonzero，C2 【不生效】
+        #               ⇒ 退化成动态 torch.nonzero，静态选页【不生效】
         #      只有 bounded replay 的尾段（late_layer_tail 非 None）会给
         #      extra 补上 Σceil(seq/ratio)，那时静态选页才回来。
         cache = getattr(metadata, "sparse_prefill_cache", None)
-        read_token_capacity = None      # ← 给 C2 静态选页的上界（行数）
+        read_token_capacity = None      # ← 给 静态选页的上界（行数）
         num_reqs = cache.num_reqs if cache is not None else None
         if cache is None:
             # ── 还没有工作区：只能估上界 ───────────────────────────────
@@ -116,7 +116,7 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
                         forward_batch.seq_lens_cpu.tolist(), extend_lens, strict=True
                     )
                 )
-            # C2 上界公式 ceil(tokens/ps) + 2*num_reqs 需要请求数
+            # 静态上界公式 ceil(tokens/ps) + 2*num_reqs 需要请求数
             num_reqs = len(extend_lens)
         # Sparse prefill dequantizes the full gathered SWA span, not only the
         # per-query attention indices.
@@ -129,8 +129,8 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
             _get_core_attn_metadata().swa_page_indices,
             # 精确读行（None 表示让池按 num_reqs / read_token_capacity 估上界）
             read_indices=cache.swa_token_ids if cache is not None else None,
-            num_reqs=num_reqs,                    # 仅 C2 用
-            read_token_capacity=read_token_capacity,   # 仅 C2 用
+            num_reqs=num_reqs,                    # 仅静态选页用
+            read_token_capacity=read_token_capacity,   # 仅静态选页用
         )
 
 
@@ -200,7 +200,7 @@ def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
                 # 读集合：indexer 为每个 query 选中的压缩块（页号）
                 core.sparse_page_indices(ratio),
                 read_indices=read_indices,                 # 有 cache → 精确行
-                num_reqs=num_reqs,                         # C2 上界用
-                read_token_capacity=read_token_capacity,   # C2 上界用
+                num_reqs=num_reqs,                         # 静态上界用
+                read_token_capacity=read_token_capacity,   # 静态上界用
                 cache_full_read=cache_full_read,           # 容量估算用
             )

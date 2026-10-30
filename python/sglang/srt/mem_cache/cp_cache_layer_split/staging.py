@@ -78,7 +78,7 @@ def contiguous_request_page_capacity(
       只会保留前 static_size 个（静默截断、无断言），remap 把溢出页映射成 -1，
       attention kernel 直接跳过 → 读到缺键的记忆。
 
-      这正是 C.4 在组合期强制退动态 nonzero 的原因
+      这正是 HICACHE_IMPLEMENTATION.md §C.4 在组合期强制退动态 nonzero 的原因
       （deepseek_v4_pool.py 的 _LS_HICACHE_BOUNDED_REPLAY 门控），
       也是"段计数方案"要补的洞：把 D_r 记账并加进 extra_segments。
     """

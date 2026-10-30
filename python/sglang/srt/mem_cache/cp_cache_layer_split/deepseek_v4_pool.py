@@ -44,7 +44,16 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 
 logger = logging.getLogger(__name__)
 
-# ── C2 总闸：LayerSplit 选页是否"静态化"（commit 61369711a；HCU 默认开）──────
+# ── 静态选页总闸：LayerSplit 选页是否"静态化"（commit 61369711a；HCU 默认开）──────
+#   ★ 命名提醒：本文件一律用"静态选页 / 动态 nonzero"这类描述性叫法，
+#     【不用 C1/C2/C3/C4 这类优化编号】—— 因为 V4.1 的 C1/C2 已专指
+#     "ratio=1 / ratio=2 的压缩 KV 家族"（kv_pools[1] / kv_pools[2]），
+#     编号与之撞车极易看错。需要指代那几个优化项时，请直呼其名：
+#       · 静态选页（nonzero_static，本段）
+#       · 层分片（LayerSplit 的 owned/非 owned）
+#       · HiCache 互斥（validation.py 的门 3）
+#       · PD 描述符匹配传输
+#
 #   LayerSplit 读非 owned 层需要两轮集合通信：
 #     第 1 轮  各 rank 把"要读的 token 下标"折成页号掩码（长度恒为 max_pages）
 #              → CP 组 all-reduce 求并集 → 取出活跃页号列表
@@ -68,7 +77,7 @@ logger = logging.getLogger(__name__)
 #   ★ 上界失效的后果是"静默错误"：真实活跃页数 > static_size 时
 #     nonzero_static 只保留前 static_size 个（无断言），溢出页被 remap 成 -1
 #     → attention 读到缺键的记忆。HiCache 的 load_back 会打破上界（段数变多），
-#     所以那条组合必须退回动态 nonzero（见 C.4 的 _LS_HICACHE_BOUNDED_REPLAY 门控）。
+#     所以那条组合必须退回动态 nonzero（见 HICACHE_IMPLEMENTATION.md §C.4 的 bounded-replay 门控）。
 _USE_STATIC_CP_LAYER_SPLIT_PAGES = is_hcu() and get_bool_env_var(
     "SGLANG_HCU_OPT_LAYERSPLIT_STATIC_PAGES", default="true"
 )

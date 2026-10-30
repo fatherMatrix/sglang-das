@@ -2776,7 +2776,7 @@ class MQALayer(MqaAttentionBase):
             # ① maybe_prefetch_cp_kv_swa（helpers :41）
             #      借「本层 SWA 窗口 KV」→ pool.prefetch_swa_layer(...)
             #      · 读集合（哪些页）：core.swa_page_indices
-            #      · 读 token 数（C2 静态选页要用它算上界）三选一：
+            #      · 读 token 数（静态选页要用它算上界）三选一：
             #          a. 有 sparse_prefill_cache → cache.swa_token_ids（精确行号）
             #          b. 无 cache + 尾段 → Σ tail.extend_seq_lens_cpu
             #             （replay 的 floor 已排除每请求 tail 之前的 SWA 历史）
@@ -3206,7 +3206,7 @@ class MQALayer(MqaAttentionBase):
         #   not is_in_breakable_cuda_graph()
         #                           BCG 内执行顺序固定、旁路流槽位管理受限，不能这样重排
         #
-        # 与静态选页（C2）的关系：Extra 异步链复用 SGLANG_HCU_OPT_LAYERSPLIT_STATIC_PAGES，
+        # 与静态选页（nonzero_static）的关系：Extra 异步链复用 SGLANG_HCU_OPT_LAYERSPLIT_STATIC_PAGES，
         #   但把它设成 0 只会关掉静态 nonzero，【不会撤销 Q 投影重排】——两者可独立开关。
         overlap_layer_split_prefetch = (
             _is_hcu

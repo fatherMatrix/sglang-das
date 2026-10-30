@@ -2546,16 +2546,53 @@ class MQALayer(MqaAttentionBase):
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
-                # 位置也要用【全局】的：有了全序列才能算正确的 RoPE 相位。
-                # 尾段（bounded replay）时行是"每请求最后 128 行"，
-                # forward_batch.positions 的行序与 kv 不一致，所以优先用
-                # tail.pos_global（已按尾段行序排好）
+                # ── 位置也要用【全局】的：有了全序列才能算正确的 RoPE 相位 ──
+                #   RoPE 是 q·e^{iθ·pos}，pos 错了相位就错；这里要处理的是
+                #   【全局行序】的 kv，所以必须配全局位置。
+                #
+                #   两个来源，优先 tail：
+                #     tail.pos_global       尾段模式下"每请求最后 128 行"的绝对位置，
+                #                           已按尾段行序排好（与 kv 的行序一致）
+                #     forward_batch.positions 普通模式；但它的行数是【整批】的，
+                #                           而 kv 可能少几行（尾部 padding 被 gather 掉）
+                #                           → 用 [: kv.shape[0]] 截齐
+                #   ★ 尾段时为什么不能用 forward_batch.positions：
+                #     尾段的行是"每请求最后 t 行"，行序与整批布局不同，
+                #     直接切前 N 行会拿到别的请求的位置。
                 tail = attn_backend.forward_metadata.late_layer_tail
                 global_positions = (
                     tail.pos_global
                     if tail is not None
                     else forward_batch.positions[: kv.shape[0]]
                 )
+                # ── 核心：一个 kernel 完成「norm + RoPE + 写 SWA 环」──────────
+                #   写入内容（MLA 惯例：cache 存的是【已 norm、已 RoPE】的形态）：
+                #     kv[0:512]  ← RMSNorm_{γ}(kv)[0:512]           ← c_KV，K-nope 与 V 共用
+                #     kv[512:576]← RoPE(RMSNorm_{γ}(kv)[512:576])   ← k_pe，只有这 64 维转
+                #   所以 attention 读 cache 时不需要再做 norm/RoPE。
+                #
+                #   参数逐个：
+                #     layer_id   全局层号；池内部会再映射成 _swa_local_layer_id
+                #                （PP / LayerSplit 分片后的本地层号）
+                #     swa_loc    目标槽位，来自 get_swa_out_cache_loc：
+                #                  ① request_window 模式 → 环形缓冲的 write_loc（不翻译）
+                #                  ② 普通 → metadata 里的 out_cache_loc
+                #                  ③ idle/空批 → 现场重翻译（旧元数据可能失效，写哑槽）
+                #     kv_weight  kv_norm 的 γ（.data 避开 autograd 记账）
+                #     eps        RMSNorm 的 ε
+                #     freqs_cis  RoPE 的 cos/sin 表（按位置索引）
+                #     positions  ← 上面算的【全局】位置
+                #
+                #   三种实现由池格式决定（set_swa_key_buffer_radix_fused_norm_rope）：
+                #     uniform_fp8        → fused_k_norm_rope_uniform_fp8
+                #     HCU bf16 attn KV   → fused_norm_rope_inplace_triton + set_key_buffer_fused
+                #                          （再 e4m3 cast，per-tensor scale 1.0）
+                #     其他（FlashMLA）    → fused_k_norm_rope_flashmla（还能顺带做 Q 的 RoPE）
+                #
+                #   ★ LayerSplit 特例：池子类里第一句就是
+                #       if not self._owns_swa_layer_id(layer_id): return
+                #     即【非 owner 的 rank 根本不做这一步】——注意 all-gather 仍然
+                #     是全员参与（集合通信），只是它拿到的结果被丢弃。
                 get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
                     layer_id=self.layer_id,
                     swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
@@ -2565,7 +2602,36 @@ class MQALayer(MqaAttentionBase):
                     freqs_cis=self.freqs_cis,
                     positions=global_positions,
                 )
-                # 环已经写完 → 告诉 backend 不用再写
+                # ── 交权：kv=None 表示"KV 已写完"
+                #   调用方据此置 save_kv_cache=False，backend 跳过自己的 store_cache；
+                #   attention 里则用 q 当 attn_k 占位（满足 k is v 断言，不会被读）。
+                #
+                # ★★★ 为什么这里只写 SWA KV？ ★★★
+                #   因为模型的 KV 由【三份独立缓存】组成，各有各的生产者：
+                #
+                #     ① SWA / 窗口 KV（逐 token，576 维 = c_KV 512 + k_pe 64）
+                #          ← 【就是这里写的】。wkv 产出的正是逐 token 的那 576 维，
+                #            也正好是 SWA 注意力要读的东西。
+                #            K-nope 与 V 共用 c_KV（num_key_value_heads == 1），
+                #            所以一个 buffer 同时装 K 和 V（forward 里那句 k is v）。
+                #
+                #     ② 压缩 KV（C1/C2，池化到 seq/ratio 行）
+                #          ← 由 compressor 写，见块 3 的 forward_low_ratio_sources；
+                #            它吃的是 x（隐藏态）自己再做投影，不吃这里的 kv；
+                #            而且只有 kv_source 层（2/8/14/20）写，其余层共享。
+                #
+                #     ③ index-K（检索键，fp4/bf16 打分用）
+                #          ← 由 indexer 写，同样吃 x / q_lora，不吃这里的 kv；
+                #            只有 index_source 层（2/8/14/20/24/28/32/36）建模块。
+                #
+                #   一句话：这里写的是"未压缩的逐 token 表示"，
+                #   压缩表示与检索键都是【另外的池、另外的 kernel、另外的层】。
+                #   如果这里把压缩 KV 也写了，会与 compressor 重复，
+                #   且行数/布局都对不上（压缩域是 seq/ratio 行）。
+                #
+                #   注意：ratio 0 的层（L0/L1）也【只】需要这份 SWA KV ——
+                #   它们没有 compressor/indexer，这也解释了为什么本支对
+                #   compress_ratio 不做任何区分。
                 kv = None
             else:
                 # 最普通的一支（单卡 / 非 CP / 非 unified）：

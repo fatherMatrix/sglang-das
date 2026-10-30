@@ -2827,6 +2827,12 @@ class MQALayer(MqaAttentionBase):
         # 【块 6】prepare 三分支（对应块 2 的判定），三条都会写 KV。
         #   返回值 kv 的语义：非 None 表示"KV 尚未写入"，交给 attention backend 写；
         #   None 表示写入已经融进 prepare 的 kernel。
+        #
+        # ★ HCU 的落点：①② 都不成立（见块 2 的逐条件分析），一律走 ③
+        #     _forward_prepare —— 也【只有 ③ 带 overlap_layer_split_prefetch 参数】。
+        #   两条多流路径（①②）里没有任何 LayerSplit 钩子，且 kv 恒为 None
+        #   （KV 写已融进 K kernel）；③ 才会返回可能的 kv 非 None
+        #   （unified 双源 / target-verify / DSA-CP 那几种"留给 backend 写"的情形）。
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.

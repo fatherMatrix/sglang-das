@@ -4094,6 +4094,31 @@ class DeepseekV4AttnBackend(
         *,
         num_qo_tokens: int,
     ) -> SparsePrefillChunkCache:
+        """建"本 chunk 的读地址表"——不算 top-k、不搬 KV、不反量化。
+
+        骨架（详细版见 docs/dsv41_forward_skeleton.html 五·5）：
+          ⓪ 取几何量：seq_lens / extend_seq_lens（尾段用 tail 那套）
+                       query_pos = seq_lens_casual[:num_qo] − 1
+                         · CP(HCU) → build_cp_sparse_query_metadata 重算 + real_query_lens
+                         · request_window → 用 layout.pos
+                       query_lens = 每请求的 query 行数（CP 下是本 rank 交错份额）
+          ① query_start_loc = cumsum(query_lens)              每请求的行区间
+          ② build_swa_token_ids → swa_token_ids / first_pos / gather_lens / offsets
+               swa_token_ids: [total_swa] 每行【整段窗口】的 SWA 池行号（非 top-k）
+               total_swa = Σ min(seq, extend + SWA_WINDOW − 1)
+          ③ 组装 SparsePrefillChunkCache（纯几何，无 KV 值）
+          ④ 预算 c0：combine_topk_swa_indices(topk=0) → ratio 0 层的最终读集合
+                     （输入 chunk-invariant，算一次 40 层复用）
+        懒算（第一次 ensure_compressed(ratio)）：
+          ⑤ c_max = max(max_seq_len // ratio, 1)；查页表把压缩域【全集】的
+             逻辑位置翻成物理 slot → flat_token_ids，并给出 workspace 的
+             compressed_base / swa_base
+
+        ★ 为什么必须给"全集"而不是 top-k：挑选要求先给全部候选打分，打分要求
+          先反量化全部，反量化要求先搬全部页 —— 只搬选中页会构成循环依赖。
+        ★ HCU 上不会被调用（入口 _forward_prefill_sparse 被 `if not _is_hcu` 挡住），
+          所以 sparse_prefill_cache 恒为 None（见调用方 maybe_prefetch_* 的注释）。
+        """
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
         # Decoder tails require explicit SWA indices to exclude unwritten history.

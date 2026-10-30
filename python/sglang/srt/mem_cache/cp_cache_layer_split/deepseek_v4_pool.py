@@ -44,6 +44,31 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 
 logger = logging.getLogger(__name__)
 
+# ── C2 总闸：LayerSplit 选页是否"静态化"（commit 61369711a；HCU 默认开）──────
+#   LayerSplit 读非 owned 层需要两轮集合通信：
+#     第 1 轮  各 rank 把"要读的 token 下标"折成页号掩码（长度恒为 max_pages）
+#              → CP 组 all-reduce 求并集 → 取出活跃页号列表
+#     第 2 轮  owner 按页号紧凑拷贝到 staging，再广播给全组
+#              广播字节数 = 页数 × item_len，页数要作为【主机侧参数】提交
+#
+#   第 1 轮末尾取页号时，torch.nonzero 的输出长度取决于设备上的掩码内容 →
+#   主机必须先把这个 count 读回来，才能分配缓冲、才能提交第 2 轮
+#   （staging.py:192 注释原文：Dynamic output size causes a device-to-host
+#    synchronization on HCU）。这一停会把设备晾在那儿、旁路流也排不进指令。
+#
+#   静态化：换成 torch.nonzero_static(size=static_size, fill_value=-1)，
+#   static_size 由 staging.contiguous_request_page_capacity 在【主机侧】
+#   用闭式上界算出来（ceil(total/page_size) + 2*num_reqs），于是第 2 轮的
+#   字节数也是常量 → 整段可以异步提交，不再卡主机。
+#
+#   代价：结果尾部带 -1 填充槽。两种消费侧各自处理：
+#     · 拷贝侧  selected_pages.clamp_min(0)  → 重复拷 page 0（内容不会被读到）
+#     · remap 侧 映射到 max_pages + i 的越界哨兵 → kernel 直接跳过
+#
+#   ★ 上界失效的后果是"静默错误"：真实活跃页数 > static_size 时
+#     nonzero_static 只保留前 static_size 个（无断言），溢出页被 remap 成 -1
+#     → attention 读到缺键的记忆。HiCache 的 load_back 会打破上界（段数变多），
+#     所以那条组合必须退回动态 nonzero（见 C.4 的 _LS_HICACHE_BOUNDED_REPLAY 门控）。
 _USE_STATIC_CP_LAYER_SPLIT_PAGES = is_hcu() and get_bool_env_var(
     "SGLANG_HCU_OPT_LAYERSPLIT_STATIC_PAGES", default="true"
 )
@@ -725,12 +750,28 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         #     None → nonzero，长度要读回设备（一次 D2H）
         if swa_cache.selected_pages is None:
             static_size = None
+            # 四道门，任一不成立就退回动态 nonzero（多一次 D2H 同步）。
+            # 之所以要"门"而不是无条件静态化：上界只对一种读集合成立——
+            #   每请求要读的 token 在【逻辑 token 空间里是连续的一段】
+            #   （extend 本体 + 它前面那 SWA_WINDOW-1 个滑窗 token）。
+            #   ① 总开关：HCU 默认 true；非 HCU 不建 LS，本段整体不走
+            #   ② read_indices / read_token_capacity 至少给一个：
+            #        上界公式的第一项 ceil(total/page_size) 需要"要读多少个 token"。
+            #        read_indices 给精确行数；read_token_capacity 是它的上界
+            #        （调用方拿不到 read_indices 时用容量代替，偏保守但仍然安全）。
+            #   ③ num_reqs 非空：上界里 +2*num_reqs 那一项需要请求数
+            #        （每请求 +2 = 一次页边界偏移 + 一次滑窗溢出，见
+            #          contiguous_request_page_capacity 的推导）
+            #   ④ request_window is None：encoder SWA replay 的读集合来自
+            #        每请求的【环形缓冲】，不是逻辑 token 空间里的连续一段，
+            #        闭式上界的前提直接失效 → 只能用动态 nonzero
             if (
                 _USE_STATIC_CP_LAYER_SPLIT_PAGES
                 and (read_indices is not None or read_token_capacity is not None)
                 and num_reqs is not None
                 and getattr(self, "request_window", None) is None
             ):
+                # 主机侧闭式算上界；这一步不碰设备，所以不会引入同步
                 static_size = contiguous_request_page_capacity(
                     read_indices.numel() if read_indices is not None else read_token_capacity,
                     num_reqs,

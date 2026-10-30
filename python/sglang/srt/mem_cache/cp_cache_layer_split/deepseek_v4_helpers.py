@@ -92,23 +92,59 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
         cache = getattr(metadata, "sparse_prefill_cache", None)
         read_token_capacity = None      # ← 给 静态选页的上界（行数）
         num_reqs = cache.num_reqs if cache is not None else None
+        # ══════════════════════════════════════════════════════════════════
+        # 这一段在算什么：「本批一共有多少个 token 的 KV 可能被读到」
+        #   （这些 token 可能是别的 rank 算的，所以要借；只需要"行数"，
+        #     不需要"是哪几行"——后者要等 attention 建出 cache 才有）
+        #
+        # 先分清两个长度（以"请求共 1000 token、本次新来 200"为例）：
+        #   seq_lens_cpu         该请求【总长】（历史+本次）       = 1000
+        #   extend_seq_lens_cpu  本次 forward【新增】多少          =  200
+        #   sliding_window       窗口大小（V4.1 = 128）            =  128
+        #
+        # 窗口语义：每个 query 行看它前面 W 个 token（含自己）。
+        # 把一批行的窗口【取并集】就是读集合，下面两支各算这个并集的长度。
+        # ══════════════════════════════════════════════════════════════════
         if cache is None:
-            # ── 还没有工作区：只能估上界 ───────────────────────────────
+            # ── 还没有工作区：只能按长度算 ─────────────────────────────
             tail = metadata.late_layer_tail
             if tail is not None:
                 # Replay floors exclude SWA history before each request's tail.
-                # ↑ 尾段：每请求只读最后 min(128, extend) 行，而 replay 的
-                #   floor 已经把 tail 之前的 SWA 历史排除掉 →
-                #   Σextend 就是【精确行数】，不是上界。
+                # ── 尾段（bounded replay）：Σ尾长，【精确】───────────────
+                # 尾段的规则是：每行的窗口下界被 floor 锁在尾段起点，
+                #   floor = seq_len - tail_len        （backend: swa_replay_start）
+                #
+                #   位置:  … 871 │ 872 ………………………………… 999
+                #                 ↑ tail 起点 = floor = seq_len - tail_len = 1000-128
+                #   第 1 行(872)： 窗口 = [872, 872]     ← 回不到 871
+                #   最后一行(999)：窗口 = [872, 999]
+                #   并集 = [872, 999] → 长度 = 128 = tail_len      ✅ 精确
+                #
+                # 因为所有行的窗口都落在同一段尾段里，并集就【恰好等于尾段本身】，
+                # 不多不少 → Σtail_len 就是真实行数，不是上界。
+                # （上面的例子：seq=1000、extend=200 → tail_len=min(128,200)=128）
                 extend_lens = tail.extend_seq_lens_cpu
                 read_token_capacity = sum(extend_lens)
             else:
                 # Before the first sparse attention builds its cache, bound the
                 # full CP union, including the history before this extend chunk.
-                # ↑ 首个稀疏 attention 之前，并不知道实际会读哪些行，
-                #   只能按"整个 CP 并集"估，且必须带上本 extend 之前那
-                #   SWA_WINDOW-1 个历史 token（滑窗跨 chunk 边界要回看）。
-                #   min(seq, extend + window - 1)：新请求不满一个窗口时取 seq。
+                # ── 非尾段：chunk + 前面 W−1 个历史，是【保守上界】──────
+                # 没有 floor，本次第一行会回看 chunk 前面的历史：
+                #
+                #   位置: … 673 ……………………… 799 │ 800 ………………………… 999
+                #         └─── 已有历史 800 ───┘ └─── 本次 extend 200 ───┘
+                #                                  ↑ chunk 起点 S=800
+                #   第一行(800) 窗口 = [673, 800]     ← 前看 W−1=127 个
+                #   最后一行(999)窗口 = [872, 999]
+                #   并集 = [673, 999] → 长度 = 327 = 200 + 127 = extend + W − 1
+                #
+                # ★ 为什么是 W−1 而不是 W：第一行自己已算在 extend 里，
+                #   它往前只能再回看 W−1 个。
+                # ★ 为什么外层还要 min(seq, …)：新请求历史不足时，下界被 0
+                #   截断。例：seq=50、extend=50 → min(50, 50+127) = 50。
+                # ★ 为什么说它是"上界"：它假设每请求都能往前看满 W−1 个；
+                #   实际窗口可能因跨 rank / 尚未本地而略少。估大了只是多搬页
+                #   （安全方向）；估小了才会被 nonzero_static 静默截断。
                 extend_lens = forward_batch.extend_seq_lens_cpu
                 read_token_capacity = sum(
                     min(seq_len, extend_len + pool.sliding_window - 1)
@@ -116,7 +152,9 @@ def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
                         forward_batch.seq_lens_cpu.tolist(), extend_lens, strict=True
                     )
                 )
-            # 静态上界公式 ceil(tokens/ps) + 2*num_reqs 需要请求数
+            # 静态上界公式 ceil(tokens/ps) + 2*num_reqs 需要【请求数】，
+            # 这个数是精确的（CPU 侧列表长度），与"行数是否精确"无关。
+            # 注意 cache 不为 None 时 num_reqs 来自 cache.num_reqs，不走这里。
             num_reqs = len(extend_lens)
         # Sparse prefill dequantizes the full gathered SWA span, not only the
         # per-query attention indices.

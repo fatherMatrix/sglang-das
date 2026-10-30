@@ -2749,6 +2749,37 @@ class MQALayer(MqaAttentionBase):
             pool = get_token_to_kv_pool()
             # 【先发起】两个预取：调用次序固定（先 swa 后 extra），
             #   且所有 rank 同序 —— 它们是集合通信，不能有人跳过
+            #
+            # ==============================================================
+            # ① maybe_prefetch_cp_kv_swa（helpers :41）
+            #      借「本层 SWA 窗口 KV」→ pool.prefetch_swa_layer(...)
+            #      · 读集合（哪些页）：core.swa_page_indices
+            #      · 读 token 数（C2 静态选页要用它算上界）三选一：
+            #          a. 有 sparse_prefill_cache → cache.swa_token_ids（精确行号）
+            #          b. 无 cache + 尾段 → Σ tail.extend_seq_lens_cpu
+            #             （replay 的 floor 已排除每请求 tail 之前的 SWA 历史）
+            #          c. 无 cache 且非尾段 → Σ min(seq, extend + window - 1)
+            #             （多算 extend 之前那 SWA_WINDOW-1 个历史 token；
+            #               首个 sparse attention 建 cache 之前只能这么保守估）
+            #      · 两轮：active_pages_for_indices（选页并集）→ _compact_broadcast_for_read
+            #
+            # ② maybe_prefetch_cp_kv_extra（helpers :80）
+            #      借「C1/C2 压缩 KV」→ pool.prefetch_low_ratio_extra_layer(...)
+            #      · 只对 compression_ratios[layer] ∈ {1,2}；ratio 0 层直接跳过
+            #      · 读集合：core.sparse_page_indices(ratio)（indexer 选中的块）
+            #      · 读 token 数：
+            #          a. 有 cache → cache.ensure_compressed(ratio, ...).flat_token_ids
+            #             ★ 注释原话：workspace 会先把【所有】压缩位置反量化再 TopK 选行，
+            #               所以只广播 TopK 页是不安全的 → 必须按完整压缩域取行
+            #          b. 无 cache + 尾段 → Σ ceil(seq_len / ratio)
+            #             （尾段 query 可能选中任一整段历史里的键，只能按上界取并集）
+            #      · cache_full_read：ratio==1 且开 SGLANG_OPT_FLASHMLA_SPARSE_PREFILL
+            #        且 min(extend) ≥ cp_size 时为真 —— 此时每个 rank 都会先建
+            #        full-history gather，所以要整段读（tail 元数据之后可能丢 cache，
+            #        但 KV 数据不丢）
+            #
+            # 两者内部都是同一套两轮协议；C2 的静态选页只影响"第 1 轮怎么取页号"。
+            # ==============================================================
             maybe_prefetch_cp_kv_swa(pool, self.layer_id, forward_batch)
             maybe_prefetch_cp_kv_extra(pool, self.layer_id, forward_batch)
             # 【再算 q_b】这就是被挪过来的那段计算，用来盖住上面两轮的通信时间。

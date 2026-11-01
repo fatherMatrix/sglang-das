@@ -984,6 +984,31 @@ class SWAComponent(TreeComponent):
                直觉：多个请求共享前缀后在某个位置分叉，分叉点**之后**的
                SWA 只属于当前请求自己（它的滑窗覆盖的是自己那条分支），
                拿去和树里共享没有意义 → 本次只插到分叉点为止。
+
+        ── 举例（把 page_size 缩成 4、sliding_window 缩成 8 便于看）──────
+          请求 B 进来时 match 到两个不同的边界：
+
+            token :  0 1 2 3 | 4 5 6 7 | 8 9 10 11 | 12 13 … 19
+            page  :     p0        p1        p2         p3 …
+            FULL  :  |<--------- 命中 12 ----------->|
+            SWA   :  |<--- 命中 8 --->|                        ← 滑窗只覆盖最后 8 个
+                                     ↑ swa_boundary_len = 8
+
+          · FULL 命中了 12 个 token（全注意力 KV 每个 token 都留）
+          · SWA 只覆盖到第 8 个（滑窗语义：更早的已被墓碑化/不在树里）
+          ⇒ 两个组件对"能共享到哪"的看法不一致
+          ⇒ branching_seqlen = 页对齐(FULL 命中 12) = 12
+             即"两边都说得清的最远位置"
+
+          于是本次插入：
+            effective_cache_len = 12  ← 只插 [0,12)；12..20 留给下一次 checkpoint
+            insert_params.swa_branching_seqlen = 12
+          插入完成后 commit_insert_component_data 会算：
+            result.swa_branch_inserted = (len(key) >= 12) = True
+            ⇒ "本次跨过了分叉点"，后续按 SWA 窗口 cap 叶子（_maybe_split_leaf_for_swa_lock）
+
+          ★ 若两边边界一致（FULL 命中 8、SWA 也 8），则 branching_seqlen = None
+            → 本方法返回 None → 不截断，这才是绝大多数情况的路径。
         """
         # ── ① 墓碑边界：未结束的请求也可能已经有一段 SWA 被驱逐 ────────────
         # Unfinished requests can already have an SWA-evicted prefix; preserve

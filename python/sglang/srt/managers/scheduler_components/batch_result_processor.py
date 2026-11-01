@@ -357,7 +357,25 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        """prefill / extend 批的结果处理 —— **KV 入树的唯一入口**。
+
+        ★ 与 KV 生命周期的关系（文档 8·1·1）：
+            forward 里各层已经把 KV 写进 L1，但此时它只是"请求私有的 out_cache_loc"，
+            radix 树里还没有任何登记。本函数逐请求决定要不要把它【登记进树】：
+
+              req.finished()          → release_kv_cache(checkpoint=True)   发布 + 释放
+              未完成（chunked/decoding）→ checkpoint_kv_cache(req)           只发布本 chunk
+
+        两条都最终走到：
+            tree_cache.checkpoint(up_to=…) → checkpoint_into_tree → insert
+            → 树产生 BackupKV action → _execute_and_commit_kv_backup → controller.write
+            → write_queue（等 Scheduler.process_batch_result 里的 flush_pending_backups 提交）
+
+        所以在本函数返回之前，"KV 写好了但还没入树"的窗口是一直存在的。
+        """
         skip_stream_req = None
+        # ① 一"组"分配的开始：本批内的 free 会攒到 free_group_end 统一归还，
+        #    避免逐条 free 时反复加锁 / 反复触发 allocator 的合并逻辑。
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
@@ -467,7 +485,13 @@ class SchedulerBatchResultProcessor:
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.kv_committed_len += 1
+                    # ② ★★ KV 入树的两个分支（8·1·1 的核心）
                     if req.finished():
+                        # ── 分支 A：请求跑完了 → 发布最后一次 + 释放设备槽位 ──
+                        #   checkpoint=True 表示"这一批 token 先入树"，随后
+                        #   release_kv_cache 会 free 掉请求私有的 out_cache_loc；
+                        #   若 backup 失败（sampling mask 场景）则 checkpoint=False，
+                        #   整段直接丢弃（宁可不缓存，也不留下一段无法回收的树节点）。
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
@@ -478,6 +502,10 @@ class SchedulerBatchResultProcessor:
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                        # ── 分支 B：本批只是 chunked prefill 的一小段 ──
+                        #   还要继续 prefill/decode，不能释放；但要先把这一段
+                        #   【登记进树】——否则这段已算好的 KV 下一 chunk 无法复用。
+                        #   up_to = req.extend_end（见 common.checkpoint_kv_cache）。
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
@@ -565,6 +593,8 @@ class SchedulerBatchResultProcessor:
                     req.output_ids.append(0)
                     req.update_finish_state()
 
+                    # 与生成式同一套两分支：跑完 → 发布后释放；未跑完 → 只发布。
+                    # （embedding 模型也有 KV 池，前缀复用规则完全一样）
                     if req.finished():
                         release_kv_cache(req, self.tree_cache, checkpoint=True)
                         req.time_stats.set_completion_time()
@@ -572,9 +602,13 @@ class SchedulerBatchResultProcessor:
                         checkpoint_kv_cache(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
+                    # 中间 chunk：不发布、不释放，只把计数减一。
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+        # ③ 结束"一组"分配：本批攒下的 free 一次性归还给 allocator。
+        #    ★ 注意顺序：先完成上面的 insert/checkpoint（它们要读这些 slot 的映射），
+        #      再统一 free —— 否则会把即将备份的页提前交还出去。
         self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req

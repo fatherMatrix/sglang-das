@@ -4911,18 +4911,37 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        # Flush async trace ops here: in overlap mode this CPU work runs while
-        # the next batch's GPU forward is in flight, giving free overlap.
+        """一次 forward 返回后的【主机侧收尾】：分派结果处理 + 提交 host 备份。
+
+        ★ 它在 KV 生命周期里的位置（见文档第八章 8·1·1 / 8·2）：
+            forward  （设备侧）  各层把 KV 写进 L1
+                ↓  返回
+            本函数   （主机侧）  process_batch_result_prefill → checkpoint → insert（入树）
+                ↓
+            flush_pending_backups()   ← ★ 本函数最后一步：把 insert 攒下的
+                                        BackupKV 真正提交成 L1→L2 的搬运
+        也就是说：**"写 L1" 在 forward 里，"入树"和"备份提交"都在本函数内完成**。
+
+        调用者：Scheduler.run_batch 走完 forward 后按模式调用（:4934 等）。
+        overlap 模式下本函数与下一批 forward 并行执行，所以这里的主机工作基本免费。
+        """
+        # ① 刷异步 trace：overlap 时这段 CPU 工作正与下一批 GPU forward 重叠。
         flush_trace_batch(batch.reqs)
+
+        # ② 发布负载快照（prefill 强制发一次），供 router 侧做调度决策。
+        #    复用同一个 snapshot，避免再走一遍队列。
         snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
-        # Router-facing gauge on the dedicated PUB socket, reusing the
-        # snapshot above rather than walking the queues again.
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads,
             force=batch.forward_mode.is_extend(),
             snapshot=snapshot,
         )
 
+        # ③ 按 forward 模式分派（★ KV 入树只发生在 prefill / decode 两条里）：
+        #      decode   → process_batch_result_decode
+        #      extend   → dllm / PD-prefill / 普通 prefill 三选一
+        #      prebuilt → 纯占位（本批没跑 forward）
+        #      idle     → 空转批（CP 下仍需参与集合通信，不能跳过）
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -4931,15 +4950,20 @@ class Scheduler(
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
+                # ★ 常规 prefill：里面做 release/checkpoint_kv_cache → insert
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
-        # Submit this batch's queued host backups before the next scheduler step.
+        # ④ ★★ L1→L2 的真正提交点（文档 8·2 的 flush 步骤）。
+        #    insert 只把 BackupKV 塞进 write_queue（flush=False），
+        #    这里才把攒下的多个节点合并成一次 L2TransferEngine.submit_device_to_host。
+        #    所以"写完 KV 却不备份"的窗口，最多只到这一行。
         self.tree_cache.flush_pending_backups()
 
+        # ⑤ 记账：step 计数 / 吞吐统计 / FPM 指标（与 KV 无关）
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)

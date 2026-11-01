@@ -267,16 +267,35 @@ def match_kv_cache(
 
 
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
-    """Publish what the running request has computed so far, unless it is
-    barred from the tree."""
-    # The tree reads req.finished() to tell a checkpoint from the final
-    # insert; a finished request belongs in release_kv_cache.
+    """把【请求到目前为止算好的 KV】发布进 radix 树（不释放设备槽位）。
+
+    ★ 这是 KV 从"请求私有"变成"可被复用"的那一刻（文档 8·1·1 分支 B）。
+      调用时机：chunked prefill 的每个 chunk 之后、或 decode 中途
+                （见 batch_result_processor.process_batch_result_prefill :481/:572）。
+
+    三个关键点：
+      · up_to = req.extend_end —— 只发布【本 chunk 末尾】为止，不是整个请求；
+        下一个 chunk 从 extend_end 继续（最后一行 req.prefix_len = req.extend_end）。
+      · 只改树的账，不碰设备槽位：KV 仍在原地，树里记的是同一批 slot 号；
+        free 由 release_kv_cache（请求结束时）负责。
+      · 可以被 skip_radix_cache_insert 关掉（例如临时请求），
+        但 allow_radix_cache_insert_once 允许"就这一次"破例。
+    """
+    # 树用 req.finished() 区分"中途发布"与"最终发布"：
+    #   跑到这里说明还没结束；已结束的请求必须走 release_kv_cache。
     assert not req.finished(), f"checkpointing finished request {req.rid}"
+
+    # 一次性放行：DSV4 的 prompt 捐赠等场景会临时允许插入一次。
     allow_once = getattr(req, "allow_radix_cache_insert_once", False)
+
+    # 允许发布 → 真正入树（可能被 skip 挡住）
     if not req.skip_radix_cache_insert or allow_once:
         req.allow_radix_cache_insert_once = False
+        # ★ 入树：内部是 checkpoint → checkpoint_into_tree → insert，
+        #   树的 BackupKV action 会在这里触发 L1→L2 备份（write_through 策略下）。
         tree_cache.checkpoint(req, up_to=req.extend_end)
-    # The next extend resumes after this one, published or not.
+
+    # 无论是否发布，下一段 prefill 都从本次末尾继续（prefix_len 是"已算到哪"）。
     req.prefix_len = req.extend_end
 
 
@@ -406,10 +425,22 @@ def discard_kv_cache_backup(
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
-    """Give the request's kv row back; with ``checkpoint`` the tree first keeps
-    what it can key."""
+    """请求结束时归还它的 KV 行：**先发布进树（可选），再释放设备槽位**。
+
+    ★ 这是 KV 生命周期里"最后一次入树 + 真正 free"的地方（文档 8·1·1 分支 A）。
+      与 checkpoint_kv_cache 的差别只有两点：
+        · up_to 用 owned_kv_len（整个请求）而不是 extend_end（本 chunk）；
+        · 发布完立刻 free 设备槽位 —— 因为请求不会再算了。
+
+      ★ 顺序不能反：
+          insert（读 slot 映射、产生 BackupKV）
+            → free（把 slot 交还 allocator）
+        如果先 free 再 insert，备份时读到的 slot 可能已被别的请求复用，
+        搬走的就是别人的 KV（静默错误）。所以 free 一定在 checkpoint 之后。
+    """
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
-    # A mamba-capable cache may alloc mamba state before alloc KV cache
+
+    # ── ① 还没分配过 KV（只有 mamba state）：直接还 mamba 槽位就结束 ──
     if not req.kv.holds_kv:
         assert tree_cache.supports_mamba(), (
             "Only a mamba-capable tree cache allows freeing before alloc"
@@ -421,29 +452,36 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
             )
             req.kv.mamba_pool_idx = None
         return
+
+    # ── ② 流式会话可能"接管"这行 KV（不释放，留给下一个请求复用）──
     if tree_cache.claim_kv_row(req):
         # A streaming session detached the kv record to keep the row.
         assert not req.kv.holds_kv
         return
 
+    # ── ③ 要发布的范围：本请求自己拥有的那一段（不含受保护的前缀）──
     owned_kv_len = req.owned_kv_len()
     checkpoint = checkpoint and not req.skip_radix_cache_insert
     if checkpoint:
-        # A tree that takes over component state (mamba) must see the request
-        # finished, or the insert forks the state and the slot leaks.
+        # 接手组件状态（mamba）的树必须看到"已结束"，否则 insert 会复制状态、槽位泄漏。
         assert req.finished() or not tree_cache.supports_mamba(), (
             f"releasing unfinished request {req.rid} into a mamba tree"
         )
-        # The fill-id array lags output_ids until the next prepare_for_decode.
+        # fill-id 数组滞后于 output_ids，直到下一次 prepare_for_decode 才更新。
         req.refresh_fill_ids()
+        # ★ 最终入树：InsertParams 的 key 来自 token ids，value 来自 req_to_token 的 slot。
+        #   树的 BackupKV action 在这里触发 L1→L2 备份（write_through 策略下）。
         tree_cache.checkpoint(req, up_to=owned_kv_len)
-    # The protected prefix is not this req's to free.
+
+    # ── ④ 释放：受保护前缀不归本请求，只还 [cache_protected_len, owned_kv_len) ──
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unlock(req.lock)
     req.lock = None
+    # 预分配多出来的尾部（kv_allocated_len > owned_kv_len）也要还掉
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
     )
+    # 通知树"这个 req 走了"：清理组件状态；checkpointed=True 时跳过（已交接给树）
     tree_cache.on_release(req, checkpointed=checkpoint)
 
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the

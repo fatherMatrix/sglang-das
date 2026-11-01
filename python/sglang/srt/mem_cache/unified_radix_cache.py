@@ -626,24 +626,40 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.prefix_len"],
     )
     def insert(self, params: InsertParams) -> InsertResult:
+        """把一个前缀插进 radix 树 —— **KV 登记的唯一入口**。
+
+        ★ 它自己不做 KV 搬运，只做两件事：
+            ① 驱动树的可恢复遍历（begin_insert / resume_insert）；
+            ② 在每一步的"屏障"处应用该步产生的 actions
+               （Backup = 备份到 L2、Free = 释放重复页、Split = 切叶…）。
+
+        为什么写成"可恢复的推泵"而不是一次递归：
+          插入过程中可能需要在某个节点【先备份完再继续】（host backup barrier），
+          也就是要等一次异步 D2H/D2H 完成。把遍历做成"可以被切开、下次 resume"
+          的形式，才能在等待期间让出主流 —— 这与 8·2 的 write 队列设计是一套。
+
+        `_apply_cache_actions` 里遇到 `BackupKV` 就调
+        `_execute_and_commit_kv_backup` → `controller.write`，这就是 L1→L2 的起点。
+        """
         if self.disable:
             return InsertResult(prefix_len=0)
-        # Fail fast on re-entrancy without touching the in-flight walk.
+        # 重入保护：树遍历里不能嵌套另一个 insert（会打乱 in-flight 的游标）。
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.begin_insert_walk()
-        # Pump the resumable insert, applying each step's actions at its barrier.
+        # 推泵：每一步先应用 actions（可能在此等待备份完成），再决定是否继续。
         try:
             step = self.tree_core.begin_insert(params)
             while True:
+                # 应用本步 actions：备份 / 释放 / 切叶 / 组件动作……
                 self._apply_cache_actions(step.actions)
                 if step.result is not None:
-                    # Walk actions flow through the steps; the result is action-free.
+                    # 走完了。actions 在过程中已逐批应用，结果里不再携带它们。
                     assert not step.result.cache_actions
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
-            # Drain still-pending actions so frees reach the allocator on abort.
+            # 即使中途异常/被拒，也要把剩余 actions 排干，否则 frees 到不了 allocator。
             self._apply_cache_actions(self.tree_core.end_insert())
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
@@ -1099,24 +1115,37 @@ class UnifiedRadixCache(BasePrefixCache):
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
-        """Insert ``[cache_protected_len, up_to)`` of the request's record and
-        move its tree lock onto the node the insert ended on."""
-        # A finished request hands its component state (mamba) to the tree
-        # instead of forking it, and the tree frees what the request still held.
+        """把请求记录里的 ``[cache_protected_len, up_to)`` 插入树，并把树锁挂到插入点。
+
+        ★ 这是"KV 入树"的**装配车间**（文档 8·1·1 的 insert 前一步）：
+              key   ← token ids（radix 用内容寻址，不看 slot）
+              value ← req_to_token 里那串 slot（★ scheduler 唯一记录的位置信息）
+              InsertParams 交给 insert()，由树自己决定要不要产生 BackupKV。
+
+        三种粒度要分清：
+          up_to            "算到哪"（本 chunk 末尾 / 整请求末），由调用方给
+          effective_cache_len  各组件协商后**真正能缓存**的长度（可能被压缩家族对齐打断）
+          page_aligned_len     key 按 page_size 对齐后的长度 —— 树里只存整页
+        """
+        # 已结束的请求把组件状态（mamba）交给树、而不是 fork 一份；树会接手它仍持有的资源。
         is_finished = req.finished()
         token_ids = req.full_untruncated_fill_ids[:up_to]
 
+        # 树被禁用（例如某些临时请求）→ 只清理组件状态，什么都不插。
         if self.disable:
             if is_finished:
                 for comp in self._components_tuple:
                     comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
+        # ★★ 位置从哪来：req_to_token 的 [0, len) 这一段 slot。
+        #    这就是文档 8·1·3 说的"只有一套 slot"——不按层、不按组件。
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
 
         # components prepare insert data + return effective cache_len
+        #   InsertParams 只带"从哪开始 / 已经插到哪 / 优先级"，key/value 稍后才填。
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             inserted_len=req.kv.cache_inserted_len,
@@ -1166,12 +1195,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
+        # ★ 树只存【整页】：key 按 page_size 对齐，value 相应截断。
+        #   所以"KV 入树"的粒度是页（与备份、广播的粒度一致）。
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
+        # copy=True：value 必须与 req_to_token 解耦 —— 请求释放后 req 那一行会被改写，
+        # 而树里的 value 要长期保存这串 slot。
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
-        insert_params.key = radix_key
-        insert_params.value = values
+        insert_params.key = radix_key       # 内容寻址（token ids）
+        insert_params.value = values        # 位置（slot 号）
+        # ★★ 真正的 insert：内部走 begin_insert/resume_insert（可恢复的多步树操作），
+        #    每步返回一批 CacheAction；其中 BackupKV 才是"备份到 L2"的信号。
         result = self.insert(insert_params)
 
         if result.rotation_tail_declined:
@@ -1318,6 +1353,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def _apply_cache_actions(
         self, actions: list[CacheAction | ComponentAction]
     ) -> None:
+        """按顺序应用一整批 action，并**就地消费**（防止被重复应用）。
+
+        用 reverse + pop + finally(reverse) 的写法是为了：
+          · 正常路径按原顺序消费；
+          · 中途抛异常时，把剩余元素按原顺序还原，交给上层的 finally 再排干。
+        """
         # Apply and consume one at a time: a spent list cannot be double-applied.
         actions.reverse()
         try:
@@ -1327,11 +1368,17 @@ class UnifiedRadixCache(BasePrefixCache):
             actions.reverse()
 
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
-        # Component actions route to their component class; the rest are
-        # cache-owned and handled here by type.
+        """单个 action 的分派器 —— 树把"要做的副作用"全部外化成 action，在这里落地。
+
+        ★ 与 KV 生命周期直接相关的只有两类：
+            BackupKV      → L1→L2 备份（本文件 8·2 的入口）
+            FreeDeviceKV  → 释放设备页（去重/淘汰后的回收）
+        """
+        # 组件动作交给组件类自己处理（SWA / Mamba / 压缩家族各有各的池）
         if isinstance(action, ComponentAction):
             self.components[action.component_type].apply_component_action(action)
         elif isinstance(action, ReplaceWriteThroughOnNodeSplit):
+            # 节点被切分时，把"待 write_through 的 ack"转移到新节点上
             self._replace_pending_write_through_node(
                 action.ack_id,
                 action.old_node_id,
@@ -1344,14 +1391,18 @@ class UnifiedRadixCache(BasePrefixCache):
                     [action.new_node_id, action.new_child_node_id],
                 )
         elif isinstance(action, FreeDeviceKV):
-            # tree values are page-aligned copies of a kv row: page-exact segments
+            # 树里的 value 是"按页对齐的 kv 行副本"，所以可以按页精确 free
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, FreeDeviceKVFullOnly):
+            # 只释放 full-attention 部分（SWA 已被墓碑化的场景）
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
+            # ★★ L1→L2 的触发点（write_through / write_through_selective）
+            #    在这条路径上：insert 的某一步产生了 BackupKV → 这里真的去备份。
             if self.linker is not None:
+                # 外部 linker 模式（Mooncake/UMBP 直连）走它自己的 offload
                 self.linker.offload_nodes(action.node_ids)
             else:
                 self._execute_and_commit_kv_backup(action)
@@ -1625,7 +1676,23 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> int:
-        """Run a backup action top-down, stopping at the first failed backup."""
+        """执行一个 BackupKV 动作：自上而下逐个节点备份，遇到失败即停。
+
+        一次动作可能覆盖**多个节点**（一条 BackupKV 链是 parent-before-child），
+        对每个节点做四件事：
+          ① build_backup_spec   取出该节点要搬的 device slot（KV + 各组件 + sidecar）
+          ② _execute_kv_backup  分配 host 槽并发起 D2H（→ controller.write，进 write_queue）
+          ③ commit_backup       把 host_indices 记回树（之后淘汰/回载都靠它）
+          ④ track_write_through 记 ack（等 flush 提交后才算真正在飞）
+
+        ★ 注意 ② 只是【入队】：真正提交给 L2TransferEngine 的是后面的
+          Scheduler.process_batch_result → flush_pending_backups → start_writing()。
+          这就是 8·2 里"insert 之后立刻备份"实际是两步的原因。
+
+        write_back=True 表示这次是【淘汰前备份】（evict_for_alloc 的 barrier 调用），
+        此时不加树锁 —— 节点马上就要被丢掉了。
+        """
+        # buffer 模式：完全不走 host 备份，只入队一个 intent，顺序由 FIFO 保证。
         if self.buffer_pipeline is not None:
             # Buffer mode bypasses the host-backup contiguity below: nothing
             # is ever host-backuped here. Contiguity comes from end-to-end
@@ -1636,22 +1703,26 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         written = 0
         for node_id in action.node_ids:
+            # ① 该节点要搬什么：KV 主值 + 各压缩组件的 transfer 描述 + sidecar 指针
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
-            # Overlapping chain actions may revisit nodes with Full KV already
-            # backed up. Skip only when no transfer remains.
+            # 链上可能重复访问已备份过的节点；只有在"没有剩余搬运"时才跳过。
             if device_value.numel() == 0 and not comp_xfers:
                 continue
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            # ② 分配 host 槽 + 发起 D2H（进 write_queue，flush 时才真正提交）
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
-                return 0
+                return 0          # host 空间不足 → 整条链停下（宁可少备份，不留半截状态）
+            # ③ 把 host 位置记回树：此后该节点视为"host 上有一份"
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
+                # write_through：节点还要继续用 → 加锁防止被淘汰
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
             publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
+            # ④ 记 ack：等 flush 提交、完成后再放开（见 _finish_write_through_ack）
             self._track_write_through_node(
                 node_id, lock_params, publish_node_ids=publish_node_ids
             )

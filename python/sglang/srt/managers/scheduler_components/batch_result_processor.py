@@ -357,34 +357,66 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        """prefill / extend 批的结果处理 —— **KV 入树的唯一入口**。
+        """prefill / extend 批的结果处理 —— **KV 入树的唯一入口**（全文 270 行，按 5 段读）。
 
-        ★ 与 KV 生命周期的关系（文档 8·1·1）：
-            forward 里各层已经把 KV 写进 L1，但此时它只是"请求私有的 out_cache_loc"，
-            radix 树里还没有任何登记。本函数逐请求决定要不要把它【登记进树】：
+        ══════════════════════════════════════════════════════════════════
+        本函数只做五件事（按执行顺序，代码里用 ①②③④⑤ 标注）：
+        ══════════════════════════════════════════════════════════════════
+          ① 开一组分配          free_group_begin()                :361
+          ② 把结果搬回 CPU      copy_done.synchronize() + tolist()   :364-392
+          ③ 逐请求循环（核心）  for i, (req, next_token_id) …        :422-560
+               3.1 判"这一批输出要不要提交"（should_commit_output）  :423-435
+               3.2 追加 hidden states（可选）                        :436-450
+               3.3 跳过：混合批里已在 decode 的 req / 被 retract 的   :452-458
+               3.4 分两支 ★★                                       :460-560
+                     A. inflight_middle_chunks <= 0（本请求收尾）
+                          → 判 finish → 【KV 入树】→ 附带输出
+                     B. > 0（还有下一个 chunk）
+                          → 不发布、不释放、不流式，只减计数
+          ④ 收尾三件套          consume_auxiliary_output → free_group_end → stream_output
+          ⑤ 统计                report_prefill_stats
+        ══════════════════════════════════════════════════════════════════
+
+        ★ 为什么说它是"KV 入树的唯一入口"（文档 8·1·1）：
+            forward 里各层已经把 KV 写进 L1，但此时它只是"请求私有的
+            out_cache_loc"，radix 树里还没有任何登记。本函数在 3.4 里逐请求决定：
 
               req.finished()          → release_kv_cache(checkpoint=True)   发布 + 释放
               未完成（chunked/decoding）→ checkpoint_kv_cache(req)           只发布本 chunk
 
-        两条都最终走到：
-            tree_cache.checkpoint(up_to=…) → checkpoint_into_tree → insert
-            → 树产生 BackupKV action → _execute_and_commit_kv_backup → controller.write
-            → write_queue（等 Scheduler.process_batch_result 里的 flush_pending_backups 提交）
+            两条都走到：
+              tree_cache.checkpoint(up_to=…) → checkpoint_into_tree → insert
+              → 树产生 BackupKV → _execute_and_commit_kv_backup → controller.write（入队）
+              → 等 Scheduler.process_batch_result 末尾的 flush_pending_backups 真正提交。
 
-        所以在本函数返回之前，"KV 写好了但还没入树"的窗口是一直存在的。
+        ★ 一个必须记住的顺序约束：
+            【先 insert，后 free】（都在 3.4 里，release_kv_cache 内部按此顺序）。
+            反过来的话，备份要读的 slot 可能已被别的请求复用 → 搬走别人的 KV。
+
+        ★ 两种模型共用同一套 KV 规则：
+            生成式（self.is_generation=True）和 embedding/reward（else 分支）
+            都是"finished → 发布后释放；未完成 → 只发布"，差别只在输出内容。
         """
         skip_stream_req = None
         # ① 一"组"分配的开始：本批内的 free 会攒到 free_group_end 统一归还，
         #    避免逐条 free 时反复加锁 / 反复触发 allocator 的合并逻辑。
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # ══════════════════════════════════════════════════════════════════
+        # 大分支一：生成式模型（有 logits / 采样 token）
+        # ══════════════════════════════════════════════════════════════════
         if self.is_generation:
+            # ② 把设备上的结果"落地"到主机：
+            #    copy_done 是 forward 里记录的一个事件 —— 等它完成，
+            #    保证接下来 tolist()/cpu() 拿到的是本次 forward 的输出而不是上一批的。
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            # 辅助输出（routed experts / indexer topk 等）在 batch 内的起始偏移
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )
             auxiliary_output = result.auxiliary_host_output
+            # 这两个是"调试/训练用"的旁路产物，尽快 finalize 掉释放显存
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -392,6 +424,11 @@ class SchedulerBatchResultProcessor:
                 result.indexer_topk_output.finalize()
                 result.indexer_topk_output = None
 
+            # 把 result 里的四样东西解包成局部变量（下面循环要用）
+            #   logits_output                  采样前的 logits（含 hidden / logprobs）
+            #   next_token_ids                 每个请求这一轮采样出的 token
+            #   extend_input_len_per_req       每请求本批输入的 token 数
+            #   extend_logprob_start_len_per_req  logprob 的起点（用于切片）
             (
                 logits_output,
                 next_token_ids,
@@ -404,11 +441,14 @@ class SchedulerBatchResultProcessor:
                 result.extend_logprob_start_len_per_req,
             )
 
-            # Move next_token_ids and logprobs to cpu
+            # ── ② 续：把"要拿在主机手上用"的张量搬回 CPU ──
+            #    next_token_ids 是唯一的强制 D2H（每个请求一个 token，很小），
+            #    后面的 logprobs / sampling mask 按需再搬。
             next_token_ids = next_token_ids.tolist()
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
             self.materialize_sampling_mask_output(batch.reqs, logits_output)
 
+            # PP 场景的校验：非末 stage 不应该有输出通信（早失败优于静默错）
             self._validate_pp_skip_output_comm(batch, result)
 
             hidden_state_offset = 0
@@ -416,10 +456,16 @@ class SchedulerBatchResultProcessor:
                 batch,
             )
 
-            # Check finish conditions
-            logprob_pt = 0
+            # ══════════════════════════════════════════════════════════════
+            # ③ 逐请求循环 —— 本函数的主体。
+            #    每个请求都走 3.1 → 3.2 → 3.3 → 3.4，
+            #    其中只有 3.4 会碰 KV（入树 / 释放）。
+            # ══════════════════════════════════════════════════════════════
+            logprob_pt = 0        # logprob 在一整块 logits 里的游标（跨请求累加）
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                # ── 3.1 这一轮采到的 token 要不要提交给客户端？ ──
+                #   三种情况不提交：已结束、被 retract（驱逐）、仍在中间 chunk。
                 should_commit_output = (
                     not req.finished()
                     and not req.is_retracted
@@ -433,6 +479,9 @@ class SchedulerBatchResultProcessor:
                     sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
                         status=status
                     )
+                # ── 3.2 追加 hidden states（仅 batch.return_hidden_states）──
+                #    这是"给上层要 hidden"的旁路：按请求切片累积到输出缓冲，
+                #    与 KV 无关，失败不影响 KV 入树。
                 if (
                     batch.return_hidden_states
                     and logits_output.hidden_states is not None
@@ -449,6 +498,10 @@ class SchedulerBatchResultProcessor:
                         ),
                     )
 
+                # ── 3.3 跳过：本请求这一轮什么都不做 ──
+                #    · 已结束且不是中间 chunk（混合批里已转 decode 的请求）
+                #    · 被 retract（已被驱逐，等恢复）
+                #    ★ 只是"不提交/不流式"，它的 KV 已在之前的收尾里处理过。
                 if (
                     req.finished() and req.inflight_middle_chunks <= 0
                 ) or req.is_retracted:
@@ -457,9 +510,19 @@ class SchedulerBatchResultProcessor:
                     # drain its accounting without streaming it.
                     continue
 
+                # ══════════════════════════════════════════════════════════
+                # 3.4 本请求【收尾分支】：inflight_middle_chunks <= 0 表示
+                #     "这是它最后一段 prefill"，可以判 finish、可以入树。
+                #     （> 0 的是中间 chunk，见下面的 else 分支）
+                # ══════════════════════════════════════════════════════════
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
+                    # ── 3.4.1 判 finish：三条互斥路径 ──
+                    #   ① sampling mask 已给出结束原因 → 直接按它结束（不 append token）
+                    #   ② beam search → 由 beam 组统一决定结束语义（token 已在 relay 点 append）
+                    #   ③ 常规 → append 本轮的 next_token_id，再由 update_finish_state()
+                    #      判断（EOS / 长度上限 / stop 串 …）
                     if sampling_mask_finish_reason is not None:
                         req.to_finish = sampling_mask_finish_reason
                         req.update_finish_state(0)
@@ -485,7 +548,8 @@ class SchedulerBatchResultProcessor:
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.kv_committed_len += 1
-                    # ② ★★ KV 入树的两个分支（8·1·1 的核心）
+                    # ── 3.4.2 ★★ KV 入树的两个分支（文档 8·1·1 的核心）──
+                    #    到这一步"KV 已在 L1 写好"，接下来决定它能否进树、何时释放。
                     if req.finished():
                         # ── 分支 A：请求跑完了 → 发布最后一次 + 释放设备槽位 ──
                         #   checkpoint=True 表示"这一批 token 先入树"，随后
@@ -510,6 +574,8 @@ class SchedulerBatchResultProcessor:
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
+                    # ── 3.4.3 附带输出（与 KV 无关，纯"把结果交给客户端"）──
+                    #    顺序很讲究：先把可能"提前结束"的分支处理完，再继续。
                     if sampling_mask_finish_reason is None:
                         self._maybe_collect_customized_info(i, req, logits_output)
 
@@ -538,15 +604,20 @@ class SchedulerBatchResultProcessor:
                             already_advanced=result.grammar_advanced,
                         )
 
+                # ══════════════════════════════════════════════════════════
+                # 3.5 中间 chunk 分支（inflight_middle_chunks > 0）：
+                #     prefill 还没跑完，本段只是"半成品"。
+                #     ★ 这里【不发布、不释放】——所以这类请求的 KV 会一直在
+                #       "已写 L1 但未入树"的状态里，直到最后一段才进 3.4。
+                # ══════════════════════════════════════════════════════════
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
+                    # 同一时刻最多只有一个请求处于 chunked 状态；
+                    # prefill 没跑完不能流式输出（半成品 token 没有意义）。
                     skip_stream_req = req
 
-                    # Incrementally update input logprobs.
+                    # 增量补 input logprobs（老 chunk 的 logprob 还没发出去）
                     if batch.return_logprob:
                         logprob_pt = self._apply_chunked_prefill_logprobs(
                             req=req,
@@ -559,6 +630,7 @@ class SchedulerBatchResultProcessor:
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+            # ③ 结尾：把旁路输出（routed experts / indexer topk 等）交给消费者
             if auxiliary_output is not None:
                 self.consume_auxiliary_output(
                     batch,
@@ -566,6 +638,11 @@ class SchedulerBatchResultProcessor:
                     auxiliary_output_starts,
                 )
 
+        # ══════════════════════════════════════════════════════════════════
+        # 大分支二：embedding / reward 模型（没有采样 token，只有向量）
+        #   结构与生成式完全同构：一样的"finished → 发布后释放；否则只发布"。
+        #   差别只在 3.x 的"附带输出"（这里有 embedding 而没有 token/grammar）。
+        # ══════════════════════════════════════════════════════════════════
         else:  # embedding or reward model
             if result.copy_done is not None:
                 result.copy_done.synchronize()
@@ -606,14 +683,19 @@ class SchedulerBatchResultProcessor:
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        # ③ 结束"一组"分配：本批攒下的 free 一次性归还给 allocator。
+        # ④-A 结束"一组"分配：本批攒下的 free 一次性归还给 allocator。
         #    ★ 注意顺序：先完成上面的 insert/checkpoint（它们要读这些 slot 的映射），
         #      再统一 free —— 否则会把即将备份的页提前交还出去。
         self.token_to_kv_pool_allocator.free_group_end()
+
+        # ④-B 流式输出：把本批新增的 token / logprob 推给 detokenizer。
+        #    skip_stream_req = 正在 chunked prefill 的那个请求（半成品不流式）。
+        #    ★ 必须在 free_group_end 之后：此时 KV 已经入树，输出与 KV 互不影响。
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )
 
+        # ⑤ 统计上报（decode→extend 转换出的批没有 prefill 统计，跳过）
         can_run_cuda_graph = result.can_run_cuda_graph
         # None on decode->extend converted batches; they are decode work and
         # have no prefill stats to report.

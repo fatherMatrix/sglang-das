@@ -1012,7 +1012,44 @@ class SWAComponent(TreeComponent):
               result.swa_branch_inserted = (len(key) >= branching)
             表示"本次插入有没有跨过这个边界"。
         """
-        # ── ① 墓碑边界：未结束的请求也可能已经有一段 SWA 被驱逐 ────────────
+        # ── ① 墓碑边界（evicted_seqlen）：把"已作废的前 N 行"告诉树 ─────────
+        #
+        #   先说 evicted_seqlen 是什么：
+        #     req.kv.component_evicted_seqlens[SWA] = N
+        #     含义：本请求的 SWA 在位置 [0, N) 上的【槽位已经被释放】了
+        #           （不是"没算过"，是"算过但已经把池子还回去了"）
+        #
+        #   谁在推进这个数（它不是插入时才产生的）：
+        #     free_swa_out_of_window_slots（common.py:72）
+        #       每次 insert 前都会调用（checkpoint_into_tree 的 ④ 步）
+        #       条件：pre_len - window >= evicted + 1（历史够长，窗口外才有可丢的）
+        #       动作：new = page_align_floor(pre_len - max(window, page_size))
+        #             free_swa_segment(req_to_token[evicted:new], start_pos=evicted)
+        #             req.kv.set_evicted_seqlen(SWA, new)
+        #     ⇒ 所以【还没结束的请求也会有一段被驱逐】：
+        #       chunked prefill 每段之后都会做一次，滑窗之外的槽位对谁都没用了，
+        #       早点还掉省内存。
+        #
+        #   时间线（一个 prefill 分 3 个 chunk，窗口 W）：
+        #     chunk1 算完 → insert 前：pre_len=300, 300-W>0 → 释放 [0, 300-W)
+        #                   evicted_seqlen 前进到 300-W
+        #     chunk2 算完 → insert 前：又释放一段 → evicted_seqlen 继续前进
+        #     ...
+        #     于是插入时【前段是墓碑、只有尾部窗口附近是 live】
+        #
+        #   树拿到这个数之后做什么（消费点）：
+        #     swa._clip_to_window（:412）：
+        #         live_start = max(start, window_start)
+        #         live_start >= end  → 整段都是墓碑 → 这段【不写 SWA value】（value 保持 None）
+        #         live_start >  start → 在 live_start 处【把节点劈开】：
+        #                               前半段不带 SWA（墓碑），后半段才写 live SWA
+        #     ⇒ 所以"墓碑"在数据上的表示就是 **component_data[SWA].value is None**，
+        #       节点的 key 长度照旧（仍参与前缀匹配），只是没有 KV。
+        #
+        #   ★ 不抄这个数会怎样（静默错误，不报错）：
+        #       树会以为 [0, N) 的 SWA 还在 → 给节点写上 value →
+        #       后来的请求命中这个节点，以为 SWA 可用 → 直接去读那批槽位 →
+        #       而那些槽位早已被 free 并分配给别人 → 读到【别人的 KV】。
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.set_evicted_seqlen(

@@ -836,9 +836,23 @@ class HiCacheController:
         return host_indices
 
     def start_writing(self) -> None:
+        """把 write_queue 里攒下的【待备份到 host】合并成一次 D2H 提交。
+
+        ★ 这是 L1→L2 的"真正发起"（文档 8·2 的最后一步）：
+            上游：insert 的 BackupKV → _execute_kv_backup → controller.write(flush=False)
+                  → write_queue.append（此时只是入队，数据还没动）
+            这里：merge 多个节点 → L2TransferEngine.submit_device_to_host → 真正搬
+            触发：Scheduler.process_batch_result 末尾的 flush_pending_backups()，
+                  或 write(flush=True) 的分支。
+
+        为什么要"攒一批再提交"：一次 D2H 的固定开销（stream 同步、描述符）与
+        页数关系不大，但每层/每节点单独提交就会变成几十次小传输 —— 合并后
+        只发一次，带宽利用率高得多。
+        """
         if len(self.write_queue) == 0:
             return
 
+        # ① 合并：把多个 CacheOperation 拼成一个（host/device 索引拼接、node_ids 并集）
         op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()

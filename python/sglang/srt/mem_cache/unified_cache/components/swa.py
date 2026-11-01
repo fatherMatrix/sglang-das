@@ -985,30 +985,31 @@ class SWAComponent(TreeComponent):
                SWA 只属于当前请求自己（它的滑窗覆盖的是自己那条分支），
                拿去和树里共享没有意义 → 本次只插到分叉点为止。
 
-        ── 举例（把 page_size 缩成 4、sliding_window 缩成 8 便于看）──────
-          请求 B 进来时 match 到两个不同的边界：
+        ── 什么是"分支点"：SWA 的可复用边界永远是【最后一个窗口】───────────
+          为什么 SWA 的命中边界几乎总比 FULL 短：
+            FULL 每个 token 都留 KV          → 命中长度 = 内容匹配长度（可以很长）
+            SWA  只保留最后一个窗口的 live KV → 命中长度 ≈ 内容匹配长度也行，
+                 但更早的节点是【墓碑】（长度记着、KV 已经还掉）
+          于是 match 会给出两个数：
+            full_kv_hit_length  = FULL 能复用到哪（长）
+            swa_boundary_len    = SWA  能复用到哪（短，通常 = 长 - 若干窗口）
+
+          举例（page_size 缩成 4、sliding_window 缩成 8）：
 
             token :  0 1 2 3 | 4 5 6 7 | 8 9 10 11 | 12 13 … 19
-            page  :     p0        p1        p2         p3 …
             FULL  :  |<--------- 命中 12 ----------->|
-            SWA   :  |<--- 命中 8 --->|                        ← 滑窗只覆盖最后 8 个
+            SWA   :  |<--- 命中 8 --->|                ← 只有最后一段是 live
                                      ↑ swa_boundary_len = 8
+            ⇒ branching_seqlen = 页对齐(12) = 12      ← FULL 的边界
 
-          · FULL 命中了 12 个 token（全注意力 KV 每个 token 都留）
-          · SWA 只覆盖到第 8 个（滑窗语义：更早的已被墓碑化/不在树里）
-          ⇒ 两个组件对"能共享到哪"的看法不一致
-          ⇒ branching_seqlen = 页对齐(FULL 命中 12) = 12
-             即"两边都说得清的最远位置"
+          这两个数不一致本身不是错误：8..12 这段本来就"FULL 有、SWA 没有"。
+          branching 只是把 FULL 的边界记下来，交给插入逻辑决定"SWA 最多铺到哪"。
 
-          于是本次插入：
-            effective_cache_len = 12  ← 只插 [0,12)；12..20 留给下一次 checkpoint
-            insert_params.swa_branching_seqlen = 12
-          插入完成后 commit_insert_component_data 会算：
-            result.swa_branch_inserted = (len(key) >= 12) = True
-            ⇒ "本次跨过了分叉点"，后续按 SWA 窗口 cap 叶子（_maybe_split_leaf_for_swa_lock）
-
-          ★ 若两边边界一致（FULL 命中 8、SWA 也 8），则 branching_seqlen = None
-            → 本方法返回 None → 不截断，这才是绝大多数情况的路径。
+          ★ 真正截断的判据（下面 ③-b）：只有 branching > cache_protected_len
+            （即"分叉点在树已拥有部分之外"）才截断；否则返回 None。
+            插入完成后 commit_insert_component_data 会算
+              result.swa_branch_inserted = (len(key) >= branching)
+            表示"本次插入有没有跨过这个边界"。
         """
         # ── ① 墓碑边界：未结束的请求也可能已经有一段 SWA 被驱逐 ────────────
         # Unfinished requests can already have an SWA-evicted prefix; preserve

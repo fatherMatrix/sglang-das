@@ -857,6 +857,43 @@ class SchedulerBatchResultProcessor:
         extend_input_len: int,
         store: bool = True,
     ) -> int:
+        """把本请求这一段 prefill 的 hidden states 摘出来，挂到 req 上（供回传客户端）。
+
+        ── 什么时候会走到这里（三种触发源，取"要得最多"的那个）─────────────
+          capture_hidden_mode = max( batch.return_hidden_states_mode,   ← 本批请求的诉求
+                                     server 级 return_hidden_states_mode,← --return-hidden-states-mode
+                                     spec_info.capture_hidden_mode )   ← 投机解码内部诉求
+
+          · 用户显式要（RLHF 采样 / reward / embedding / 蒸馏）：
+              服务端 `--return-hidden-states-mode {last,full}`
+              （或 `--enable-return-hidden-states` = full），
+              请求级 `return_hidden_states: true | "last"`。
+          · 投机解码（EAGLE / DSpark）：draft 模型要吃 target 的 hidden，
+              由 spec_info.capture_hidden_mode 设置（FULL/LAST），与用户参数无关。
+          · PD 分离 / EPD 之类需要把 prefill 的 hidden 交给下游的阶段。
+
+          注意 max() 的语义：NULL(0) < LAST(1) < FULL(2)，
+          只要有一方要 FULL，就按 FULL 抓（多抓不会错，少抓会算不出来）。
+
+        ── 两个模式 ────────────────────────────────────────────────────────
+          FULL：本请求在 logits_output.hidden_states 里占 [start, start+extend_input_len)
+                return_hidden_states is True   → 整段都存
+                return_hidden_states == "last" → 只存最后一行（省内存）
+          LAST：缓冲里每个请求只写了 1 行（其最后一个 token），取 [index] 即可。
+
+        ── offset 是"整个 batch 的游标"，不是本请求的偏移 ──────────────────
+          hidden_states 是【整个 batch 拼接】的，所以无论存不存，指针都必须
+          前进 extend_input_len（FULL）/ 1（LAST）；否则后面的请求会错位。
+
+        ── store=False 的含义（与 3.1 的 should_commit_output 同源）──────────
+          这一轮的输出不算数（中间 chunk / retracted / sampling mask 结束），
+          于是【只推进指针、不 append 到 req】—— 既不给客户端，也不占内存。
+
+        ── 代价 ────────────────────────────────────────────────────────────
+          `.cpu().tolist()` 是真实的 D2H + 逐元素转 Python 对象：
+          FULL 模式下 prefill 1000 token 就是 1000 × hidden_size 个 float 落地，
+          很贵。所以默认关闭，只在需要训练/reward 的离线或小批量场景开启。
+        """
         if capture_hidden_mode.is_full():
             start = hidden_state_offset
             hidden_state_offset += extend_input_len

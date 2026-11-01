@@ -1007,6 +1007,13 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
     ) -> PrefetchOperation:
+        """★【KV 四级生命周期 · L3 → L2】storage backend → host 池。
+
+        两段式：先 batch_exists_v2 只查 hash（便宜），命中后才 batch_get_v2 把页拉进 host。
+        完成回调在 unified_radix_cache._handle_prefetch_result()，之后节点处于
+        "host 有、device 没有" 的状态，等 load_back() 才搬进 L1。
+        反向写出见 write_storage()（L2 → L3，按 hash 寻址）。
+        """
         operation = PrefetchOperation(
             handle,
             new_input_tokens,

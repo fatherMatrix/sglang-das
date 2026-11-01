@@ -1679,7 +1679,18 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
-        """Execute Backup action."""
+        """Execute Backup action.
+
+        ★【KV 四级生命周期 · L1 → L2】device HBM → host 池的唯一入口。
+
+          触发：device 侧 radix 节点即将被淘汰（或 write_through 策略要求立刻备份）。
+                一旦 free 就不可恢复，所以必须在淘汰【之前】把数据搬走。
+          去向：anchor 池（KV）+ 各压缩家族（comp_xfers）+ sidecar（indexer 等）。
+          执行：cache_controller.write(...) → write_queue → start_writing()
+                → L2TransferEngine.submit_device_to_host()（后台线程，按【页】搬）
+          注：flush=False 是让下一次 flush 把多个待备份节点合并成一次搬运。
+          逆过程见 load_back()（L2 → L1，配合 wait_layer_transfer 的层事件）。
+        """
         kv_tokens = len(device_value)
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
         if (
@@ -1844,7 +1855,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
 
-        # Load H→D
+        # ★【KV 四级生命周期 · L2 → L1】host 池 → device HBM（本函数 = load_back 的执行段）。
+        #
+        #   触发：前缀在 L2 命中、且这次 forward 真的要用它（否则不必搬回）。
+        #   前置：先确保 device 有地方（上面 evict_for_alloc），否则搬回来也没处放。
+        #   执行：cache_controller.load(...) → load_queue → start_loading()
+        #         → L2TransferEngine.submit_host_to_device()（后台线程，按【页】搬）
+        #
+        #   ★ 关键契约：搬运按【层】切片提交，每完成一层就打一个 LayerDoneCounter 事件；
+        #     计算侧必须 pool.wait_layer_transfer(layer_id) 等它 —— 这也是 LayerSplit
+        #     第 2 轮广播（从 owner 的持久 buffer 拷页）能读到"回载后"内容的前提。
+        #   逆过程见 _execute_kv_backup()（L1 → L2）。
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         device_indices = self.cache_controller.load(
@@ -1925,6 +1946,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus
     def write_backup_storage(self, node_id: NodeId) -> None:
+        """★【KV 四级生命周期 · L2 → L3】host 池 → storage backend（磁盘/远端）。
+
+          与 L1→L2 的本质差别：L3 用【内容 hash】寻址（spec.hash_value / prefix_keys），
+          不认页号或 slot —— 所以同一个前缀在 L3 只存一份，与 L2 的"页"没有对应关系。
+          执行：cache_controller.write_storage(...) → backup 队列
+                → backup_thread_func() → storage_backend.batch_set_v2()
+          逆过程见 controller.prefetch()（L3 → L2：先 batch_exists 再 batch_get_v2）。
+        """
         if not self.enable_storage or self.cache_controller is None:
             return
         spec = self.tree_core.build_storage_backup_spec(

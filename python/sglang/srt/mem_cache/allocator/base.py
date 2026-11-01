@@ -193,10 +193,32 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return torch.cat((self.free_pages, self.release_pages))
 
     def free_group_begin(self):
+        """开始一个"延迟释放组" —— 注意：**不分配任何东西**。
+
+        名字里的 group 指的是"把这一批 free 归成一组"，不是"分配一组"。
+        调用后 self.free_group 从 None 变成 []，于是接下来的每次 free()
+        都不再立即归还，而是把索引 clone 一份 append 进这个列表
+        （见各 free() 实现里的 `if self.free_group is not None:` 分支）。
+
+        ★ 为什么要延迟（两个理由，第二个更重要）：
+          ① 性能：每次 free 都要维护 free_pages 并集 / 排序 / 加锁，
+             一批几十个请求逐条做就是几十次小操作；攒到末尾一次 cat+free 只做一次。
+          ② 正确性：一批动作里经常出现"先 free 旧页、再给同一位置装新映射"的中间态
+             （见 swa.py 的注释：a cache action later in this group may install a new
+             mapping for the same full index）。立即归还的话，别的请求可能在这两步之间
+             拿到那个"还没备份完"的页 —— 读到脏数据。整批结束后统一归还才安全。
+        """
         assert self.free_group is None, "free groups cannot be nested"
         self.free_group = []
 
     def free_group_end(self):
+        """结束延迟释放组：把攒下的索引拼成一个大张量，只调一次 free()。
+
+        ★ 调用点必须在"本批所有需要读这些 slot 的动作"之后：
+          例如 process_batch_result_prefill 里，insert/checkpoint 要先按
+          req_to_token 的映射把 KV 登记进树（可能要备份到 host），
+          然后才 free —— 顺序反过来就会把即将备份的页提前交还出去。
+        """
         pending, self.free_group = self.free_group, None
         if pending:
             self.free(torch.cat(pending))

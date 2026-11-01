@@ -464,8 +464,24 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0        # logprob 在一整块 logits 里的游标（跨请求累加）
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                # ── 3.1 这一轮采到的 token 要不要提交给客户端？ ──
-                #   三种情况不提交：已结束、被 retract（驱逐）、仍在中间 chunk。
+                # ── 3.1 "输出提交"：这一轮采到的 token 算不算数？ ──
+                #
+                # 前置知识：**一次 forward 只产出 1 个 token**
+                #   prefill  ：对输入最后一个位置采样 → 得到"第一个生成 token"
+                #   decode   ：对当前最后一个位置采样 → 得到"下一个 token"
+                # 但这 1 个 token 有三种情况【不是】该请求真正的下一个 token，
+                # 一旦 append 进 req.output_ids 就会污染输出（重复/乱序/错字）：
+                #
+                #   ① req.finished()                —— 已经结束，再 append 就重复了
+                #   ② req.is_retracted              —— 正在被驱逐/恢复（KV 已搬走或待搬回），
+                #                                      这一轮采样结果不代表请求状态
+                #   ③ inflight_middle_chunks > 0    —— 这是 chunked prefill 的中间 chunk：
+                #                                      本次喂进去的这段不是请求的结尾，
+                #                                      在它的末尾采样毫无意义
+                #                                      （真正的 token 要等最后一段才采）
+                #
+                # "提交" = append 到 req.output_ids + update_finish_state() + 流式发出。
+                # 不提交时 token 会被直接丢弃（下面的 else 分支只减计数）。
                 should_commit_output = (
                     not req.finished()
                     and not req.is_retracted

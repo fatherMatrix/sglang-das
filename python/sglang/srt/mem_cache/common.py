@@ -473,7 +473,16 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         #   树的 BackupKV action 在这里触发 L1→L2 备份（write_through 策略下）。
         tree_cache.checkpoint(req, up_to=owned_kv_len)
 
-    # ── ④ 释放：受保护前缀不归本请求，只还 [cache_protected_len, owned_kv_len) ──
+    # ── ④ 释放：只还"树没接手"的那一段，不是整段 KV ──
+    #   checkpoint_into_tree 末尾有一句
+    #       req.kv.cache_protected_len = len(new_indices)
+    #   即：入树成功后，保护长度被推进到"树真正拥有的长度"（页对齐后的前缀）。
+    #   所以这里的区间 [cache_protected_len, owned_kv_len) 通常只剩
+    #   **页对齐余下的尾巴**（< page_size 个 token）；如果 checkpoint=False，
+    #   则是"整段都没进树"，这段会被完整丢弃。
+    #   ★ 交给树的那部分 KV **不会**在这里释放 —— 它已经变成可复用的前缀缓存。
+    #   ★ 归还走 allocator 的延迟队列（本批由 free_group_begin/end 包住），
+    #     真正的 free_pages 更新发生在 process_batch_result_prefill 的批末。
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unlock(req.lock)
     req.lock = None

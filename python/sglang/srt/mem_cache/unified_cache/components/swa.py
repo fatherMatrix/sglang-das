@@ -961,29 +961,70 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        """SWA 组件在 insert 前的"表态"：**填两个字段 + 可能截断长度**。
+
+        文件签名约定（见 base.py 的同名方法）：
+            return None  → 不表态，用全长
+            return int   → 本轮只插到这么长（effective_cache_len 取各组件 min）
+
+        它只做三件事，**不碰任何数据**（KV 早在 forward 里写好了）：
+
+          ┌─ ① 墓碑边界   evicted_seqlen
+          │    把"这段 SWA 已被驱逐/捐赠"的长度抄进 InsertParams。
+          │    插入时这段只写【墓碑】而不是 live SWA —— 否则会把已经还掉的
+          │    滑窗 KV 重新当成有效数据，别人命中后读到空洞。
+          │
+          ├─ ② 强制建叶   force_leaf_creation
+          │    DSV4 的 prompt 捐赠要求"即使前缀已存在也建一个新叶子"，
+          │    且该叶子是 full-only（SWA 全墓碑）。
+          │
+          └─ ③ 分支点     swa_branching_seqlen
+               含义（base_prefix_cache 的字段注释）："如果存在 SWA 窗口，
+               最长能 page 对齐命中到哪个位置"。
+               直觉：多个请求共享前缀后在某个位置分叉，分叉点**之后**的
+               SWA 只属于当前请求自己（它的滑窗覆盖的是自己那条分支），
+               拿去和树里共享没有意义 → 本次只插到分叉点为止。
+        """
+        # ── ① 墓碑边界：未结束的请求也可能已经有一段 SWA 被驱逐 ────────────
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
+        # ── ② 强制建叶：DSV4 prompt 捐赠等场景要求"无论如何新开叶子" ────────
         insert_params.force_leaf_creation = getattr(
             req, "force_radix_leaf_creation", False
         )
 
+        # ── ③-a 混合 SSM 模型：让 MambaComponent 说了算 ─────────────────────
+        #    原因：SSM 的 checkpoint 必须挂在**精确的 token 前缀**上，
+        #    若 SWA 先截断，mamba 状态与前缀就对不上了。所以这里直接弃权。
         # A recurrent checkpoint must stay attached to its exact token prefix.
         # Let MambaComponent select the insertion length for hybrid caches.
         if self.cache.is_mamba_enabled:
             return None
 
+        # ── ③-b 没有分支点，或分支点落在"已保护前缀"之内 → 不截断 ──────────
+        #    cache_protected_len = 树里已经拥有的长度；
+        #    分支点 <= 它 意味着"分叉发生在树已有的部分"，本次新增的尾巴
+        #    本来就不受分叉影响，无需限制。
         branching_seqlen = req.swa_branching_seqlen
         if branching_seqlen is None or branching_seqlen <= req.kv.cache_protected_len:
             return None
 
+        # ── ③-c 真要截断：长度 = 分支点（EAGLE 的 key 要 +1）───────────────
+        #    EAGLE 的 key 是 bigram：N 个 bigram 覆盖 N+1 个 token，
+        #    所以"覆盖到第 branching_seqlen 个 token"要 +1 个 bigram。
         # An EAGLE key with N bigrams spans N + 1 raw tokens.
         effective_cache_len = branching_seqlen + int(self.tree_core.is_eagle)
+        # 分支点比本次可插的总长还大 → 截了也没有意义，维持全长。
         if effective_cache_len > token_ids_len:
             return None
 
+        # ── ③-d 把边界写回 InsertParams ───────────────────────────────────
+        #    commit_insert_component_data 用它判断
+        #    result.swa_branch_inserted = len(key) >= branching_seqlen
+        #    （本次插入是否跨过了分叉点，决定后续 SWA 保留/裁剪策略）。
         # Record the logical SWA branch boundary for insertion.
         insert_params.swa_branching_seqlen = branching_seqlen
         return effective_cache_len

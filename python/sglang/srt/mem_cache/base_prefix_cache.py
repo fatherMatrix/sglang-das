@@ -78,39 +78,61 @@ class MatchPrefixParams:
 
 @dataclasses.dataclass
 class InsertParams:
-    """Unified parameters for insert across different cache types"""
+    """一次 insert 的全部入参（不同缓存类型共用这一个结构）。
 
-    key: Optional[RadixKey] = None
-    value: Optional[torch.Tensor] = None
+    ★ 两个核心字段是 key / value —— **内容寻址 + 位置**：
+        key   = token ids（含 page 对齐后的长度）
+        value = 每个 token 在 KV 池里的 slot 号（来自 req_to_token）
+      其余字段都是"这次插入的上下文约束"，告诉树该怎么合并/切分/记账。
 
-    # Mamba specific
+    构造时机（unified_radix_cache.checkpoint_into_tree:1149）：
+      先只用上下文（prev_prefix_len / inserted_len / priority / session / rotation_base），
+      key/value 等组件协商出 effective_cache_len 并做 page 对齐后才填。
+    """
+
+    # ── 核心：插什么 ──────────────────────────────────────────────
+    key: Optional[RadixKey] = None       # 内容（token ids + extra_key + salt + is_bigram）
+    value: Optional[torch.Tensor] = None # 位置（每 token 一个 slot；必须 copy，见调用处）
+
+    # ── Mamba 专用（SSM 状态无法按 token 寻址，只能整段挂）────────
     mamba_value: Optional[torch.Tensor] = None
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
-    mamba_keep_idx: Optional[int] = None
+    mamba_keep_idx: Optional[int] = None   # ping-pong 槽位选择，cleanup 必须用同一个
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
-    c128_value: Optional[torch.Tensor] = None
+    c128_value: Optional[torch.Tensor] = None   # C128 sidecar：一页一个 id
 
-    # SWA specific
+    # ── SWA 专用 ─────────────────────────────────────────────────
     prev_prefix_len: int = 0
+    # ↑ 本次插入的起点： [0, prev_prefix_len) 是树里已有的前缀（不重复插、不重复 free）
     swa_branching_seqlen: Optional[int] = None
+    # ↑ 分支场景（多个请求共享前缀后分叉）：SWA 需要保留到哪个长度
     force_leaf_creation: bool = False
+    # ↑ 即使前缀已存在也强制建新叶子（DSV4 的 prompt 捐赠用：只建 full-only 叶子）
 
-    # General
+    # ── 通用 ─────────────────────────────────────────────────────
     component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
         default_factory=dict, kw_only=True
     )
+    # ↑ 各组件"已被标记为驱逐"的长度（例如 SWA 墓碑化），插入时据此决定哪些段算无效
     # The inserting request already inserted [0, here) (req.kv.cache_inserted_len);
     # only the nodes past it count a hit, so a request counts each node once.
     inserted_len: int = 0
+    # ↑ 本请求已经插过 [0, here)：只有超过这里的节点才算"命中"，
+    #   避免同一个请求对同一批节点重复记命中
     priority: int = 0
+    # ↑ 插入优先级：命中/复用节点时用（越大越优先被保留）；prompt 切分时会 +1
     session_id: Optional[str] = None
+    # ↑ 流式会话 id：同一会话的节点可被会话引用持有
     track_adopted_ranges: bool = False
+    # ↑ 是否记录"本次复用了哪些已有节点的区间"（用于审计/释放）
 
     # Logical-page KV sharding: rotation base of the chain the inserted
     # values belong to (stamped onto new tree nodes; None when sharding is
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
+    # ↑ 逻辑页分片（cyclic-owner）时，这串 value 属于哪条 rotation 链：
+    #   会写进新节点；None 表示没开分片。不同 base 的节点不能混用 locs。
 
     def get_evicted_seqlen(self, component_type: ComponentType) -> int:
         return self.component_evicted_seqlens.get(component_type, 0)
@@ -121,13 +143,24 @@ class InsertParams:
 
 @dataclasses.dataclass
 class InsertResult:
-    """Result of an insert operation"""
+    """一次 insert 的结果：树把 key 吃进去多少、吃到了哪个节点、有没有被拒。
+
+    调用方（checkpoint_into_tree）主要用三样：
+        result.prefix_len            → 判断插入是否真的前进（新前缀长度）
+        result.last_device_node      → 把请求的锁挂到这个叶子上
+        result.rotation_tail_declined→ 被分片契约拒绝时，整段不动、直接放弃
+    """
 
     prefix_len: int
+    # ↑ 插入后该 key 在树里的**公共前缀长度**（可能小于请求长度：尾部还没进树）
     total_len: int = 0
+    # ↑ 插入覆盖的总长度（含被合并到已有节点的部分）
     last_device_node: Any = None
+    # ↑ 插入结束所在节点 —— 请求随后 lock 它，防止用着的时候被淘汰
     mamba_exist: bool = False
+    # ↑ 命中已有 mamba 状态（不新建），用于 SSM 状态的 ping-pong 复用判断
     swa_branch_inserted: bool = False
+    # ↑ 是否因"分支"而插入了一段 SWA（决定后续要保留/裁剪多少个窗口）
 
     # Logical-page KV sharding: the un-matched tail was NOT inserted because
     # its rotation base disagrees with the matched chain's (a cross-chain

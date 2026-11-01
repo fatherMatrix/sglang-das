@@ -1126,6 +1126,24 @@ class UnifiedRadixCache(BasePrefixCache):
           up_to            "算到哪"（本 chunk 末尾 / 整请求末），由调用方给
           effective_cache_len  各组件协商后**真正能缓存**的长度（可能被压缩家族对齐打断）
           page_aligned_len     key 按 page_size 对齐后的长度 —— 树里只存整页
+
+        ══════════════════════════════════════════════════════════════════
+        十四条步骤（代码里用 ① ~ ⑭ 标注，可对照阅读）：
+          ① 组装 InsertParams（上下文：prev_prefix_len / inserted_len / priority …）
+          ② 各组件协商 effective_cache_len（取 min）+ floor_cache_len 对齐
+          ③ 建 RadixKey（token 内容 + extra_key + salt + is_bigram）
+          ④ 未结束的请求：先放掉滑窗之外的 SWA 槽位
+          ⑤ effective_cache_len<=0 → 只清理，不插
+          ⑥ page 对齐 key/value → self.insert(params)  ← 真正入树
+          ⑦ 被 rotation 分片契约拒绝 → 整段放弃（请求继续独占自己的页）
+          ⑧ 单组件模型：在 prompt 边界再插一次，把叶子切成 prompt / 生成两段
+          ⑨ 重新 match：拿到插入后树上的 canonical 路径
+          ⑩ 把 req_to_token 改绑到 canonical 位置（去重）
+          ⑪ 换锁：unlock 旧叶子、lock 新叶子
+          ⑫ 账本：cache_protected_len 前进到 len(new_indices) ← release 只 free 尾巴的原因
+          ⑬ 组件清理（MAMBA ping-pong / 压缩半块 / 交接组件状态）
+          ⑭ 流式会话：结束请求登记叶子引用
+        ══════════════════════════════════════════════════════════════════
         """
         # 已结束的请求把组件状态（mamba）交给树、而不是 fork 一份；树会接手它仍持有的资源。
         is_finished = req.finished()
@@ -1144,8 +1162,11 @@ class UnifiedRadixCache(BasePrefixCache):
             req.kv.req_pool_idx, : len(token_ids)
         ]
 
-        # components prepare insert data + return effective cache_len
-        #   InsertParams 只带"从哪开始 / 已经插到哪 / 优先级"，key/value 稍后才填。
+        # ── ① 组装 InsertParams：先只放上下文，key/value 稍后填 ──────────────
+        #   prev_prefix_len = cache_protected_len
+        #     ↑ 树里【已经拥有】的前缀长度（上一次 insert 后推进的），本次只插它之后的部分
+        #   inserted_len    = cache_inserted_len
+        #     ↑ 本请求已插过的长度；只有超过它的节点才记"命中"，防止重复计数
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             inserted_len=req.kv.cache_inserted_len,
@@ -1153,6 +1174,11 @@ class UnifiedRadixCache(BasePrefixCache):
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
+
+        # ── ② 各组件协商"真正能缓存多长" ────────────────────────────────────
+        #   每个组件（FULL / SWA / MAMBA / 压缩家族…）都能独立否决尾部：
+        #     例：SWA 只有窗口内的数据有意义；压缩家族要求对齐到 ratio 边界。
+        #   取所有组件的 min ⇒ effective_cache_len（最保守的那个说了算）。
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
@@ -1164,9 +1190,15 @@ class UnifiedRadixCache(BasePrefixCache):
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
 
+        # 再把长度往下取整到组件要求的边界（floor_cache_len，例如按页/按 ratio）
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
+        # ── ③ 建 Radix 的 key（内容寻址）─────────────────────────────────────
+        #   key 只含 token 内容 + 会影响"能否复用"的额外维度：
+        #     extra_key  ：多模态/agent 之类的命名空间隔离
+        #     is_bigram  ：EAGLE 的 bigram key 比 token 数少 1
+        #     cache_salt ：用户级缓存盐（同内容不同盐不能互相命中）
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
             req.extra_key,
@@ -1174,6 +1206,10 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=req.cache_salt,
         )
 
+        # ── ④ 未结束的请求：把"滑窗之外"的 SWA 槽位先放掉 ───────────────────
+        #   插入会停在 page_floor(len(key))，如果叶子上保留的 SWA 不足一个窗口，
+        #   插入后的 match 会把它判为不可用。所以先把窗口外的槽位释放（它们本来
+        #   也永远不会再被读到）。bigram key 比它覆盖的 token 少 1，故用 len(key)-1。
         if (
             not is_finished
             and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
@@ -1186,6 +1222,7 @@ class UnifiedRadixCache(BasePrefixCache):
             for comp in self._components_tuple:
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
+        # ── ⑤ 长度为 0（对齐后什么都不剩）→ 只做清理，不插 ──────────────────
         if effective_cache_len <= 0:
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
@@ -1209,6 +1246,10 @@ class UnifiedRadixCache(BasePrefixCache):
         #    每步返回一批 CacheAction；其中 BackupKV 才是"备份到 L2"的信号。
         result = self.insert(insert_params)
 
+        # ── ⑦ 插入被"分片契约"拒绝 → 整段放弃，保持请求独占自己的页 ────────
+        #   场景：分页分片（rotation_base）下，本次 value 所属的链与已匹配链不一致。
+        #   若强行 graft，请求那一行会混用两条链的 locs，破坏 cyclic-owner gather 契约。
+        #   所以：不做去重 free、不重绑定、不改保护长度 —— 该请求继续用自己的页。
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined
             # batches raced this request's insert against another chain over
@@ -1224,11 +1265,13 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, is_finished=is_finished, insert_params=insert_params
                 )
             return
+        # 记账：本请求已插到 page_aligned_len（只增不减，供下次 inserted_len 用）
         req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, page_aligned_len)
 
-        # Split the leaf at the prompt boundary so eviction can drop the output
-        # KV without the prompt. prev_prefix_len keeps the overlapping indices
-        # from being freed as duplicates.
+        # ── ⑧ 在 prompt 边界把叶子切开（仅单组件 / 纯 FULL 的模型）───────────
+        #   目的：让"prompt 段"和"生成段"成为两个节点 ——
+        #   淘汰时可以只丢生成段的 KV，prompt 仍可复用。
+        #   prev_prefix_len=len(prompt_key) 让重叠的那段不被当作重复页 free 掉。
         prompt_key = RadixKey(
             req.origin_input_ids,
             req.extra_key,
@@ -1247,10 +1290,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     value=values[: len(prompt_key)],
                     prev_prefix_len=len(prompt_key),
                     inserted_len=len(prompt_key),
-                    priority=insert_params.priority + 1,
+                    priority=insert_params.priority + 1,   # prompt 段优先级更高（更该留住）
                 )
             )
 
+        # ── ⑨ 重新 match 一次：拿到"插入后树里到底有什么" ─────────────────────
+        #   为什么要 match 而不是直接用 result：
+        #     insert 可能把多个请求的相同前缀合并到同一个节点，canonical 的
+        #     device locs 由树决定；请求要"改绑"到那份 canonical 页上（去重），
+        #     所以必须从树上重新取一次路径。
+        #   return_full_match：DSV4 的 prompt 捐赠建的是 full-only 叶子（SWA 是墓碑），
+        #   必须按 full 的驻留情况来改绑。
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
         # DSV4 prompt donation deliberately creates a full-only leaf whose SWA
@@ -1263,7 +1313,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         )
         new_last_node = match_result.last_device_node
-        new_indices = self.path_device_indices(new_last_node)
+        new_indices = self.path_device_indices(new_last_node)   # 树上该路径的全部 slot
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
@@ -1271,11 +1321,16 @@ class UnifiedRadixCache(BasePrefixCache):
         assert new_prefix_len <= len(new_indices), (
             f"{new_prefix_len=}, {len(new_indices)=}"
         )
+        # ── ⑩ 把请求的 req_to_token 改绑到树上的 canonical 位置 ──────────────
+        #   只改 [cache_protected_len, len(new_indices)) 这一段（之前已共享的前缀不动）。
+        #   ★ 这一步就是"去重"：请求原来自己那份重复页，之后会被 insert 的
+        #     FreeDeviceKV action 释放掉（不是在这里 free）。
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
         )
 
+        # ── ⑪ 换锁：从旧叶子挪到新叶子（只动引用计数，不动数据）──────────────
         self.unlock(req.lock)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
         # already COW'd to the request's own slot, never read from this node again).
@@ -1292,11 +1347,15 @@ class UnifiedRadixCache(BasePrefixCache):
             ),
         )
 
-        # Update req fields
+        # ── ⑫ 更新请求账本：保护长度前进到"树真正拥有"的长度 ─────────────────
+        #   ★ 这一行是 release_kv_cache 只 free "尾巴"的原因（见 common.py:【④】）：
+        #     之后 [0, cache_protected_len) 归树所有，请求无权再释放。
         req.kv.cache_protected_len = len(new_indices)
-        req.last_node = new_last_node
+        req.last_node = new_last_node     # 下次插入/淘汰从从这里继续
 
-        # cleanup
+        # ── ⑬ 组件清理：把"这次没进树的临时数据"收尾 ─────────────────────────
+        #   例如 MAMBA 的 ping-pong 槽位、压缩家族未凑满一组的半块等；
+        #   is_finished=True 时还要把组件状态交接给树（不 fork）。
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req,
@@ -1305,6 +1364,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 insert_params=insert_params,
             )
 
+        # ── ⑭ 流式会话：结束的请求把"叶子引用"登记到会话，供后续同会话请求复用 ──
         if self.enable_session_radix_cache and is_finished:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

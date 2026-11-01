@@ -1176,9 +1176,23 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # ── ② 各组件协商"真正能缓存多长" ────────────────────────────────────
-        #   每个组件（FULL / SWA / MAMBA / 压缩家族…）都能独立否决尾部：
-        #     例：SWA 只有窗口内的数据有意义；压缩家族要求对齐到 ratio 边界。
-        #   取所有组件的 min ⇒ effective_cache_len（最保守的那个说了算）。
+        #   每个组件都能独立否决尾部，取 min ⇒ effective_cache_len（最保守者说了算）。
+        #
+        #   ★ V4.1 Flash（DCU）上 self._components_tuple 只有两个：
+        #       FULL（ComponentType.FULL，id=0）—— FullComponent 不覆写
+        #            prepare_for_caching_req → 走 base 的 `return None`（不表态，用全长）
+        #       SWA （ComponentType.SWA， id=1）—— SWAComponent 会：
+        #            ① 把 req.kv.get_evicted_seqlen(SWA) 写进 insert_params
+        #               （"这段已被墓碑化"的边界，插入时按墓碑处理）
+        #            ② 若 swa_branching_seqlen > cache_protected_len，返回
+        #               branching_seqlen + is_eagle（分支点之前才值得入树）
+        #     MAMBA / C128 在 DCU 上不存在（C128 是 NPU 的 sidecar，
+        #     MAMBA 要求 hybrid_ssm）。压缩 KV（C1/C2）与 indexer 池
+        #     【不是】tree component —— 它们以"随节点一起搬的附加 transfer"
+        #     （comp_xfers / sidecar）形式参与备份，不参与长度协商。
+        #
+        #   floor_cache_len：只有 NPU 的 C128 sidecar 覆写（对齐 C128 页组）；
+        #     FULL / SWA 都是 base 的恒等实现，所以 DCU 上这一步不改长度。
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(

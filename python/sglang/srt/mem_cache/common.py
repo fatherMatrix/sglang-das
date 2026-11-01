@@ -285,7 +285,20 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     #   跑到这里说明还没结束；已结束的请求必须走 release_kv_cache。
     assert not req.finished(), f"checkpointing finished request {req.rid}"
 
-    # 一次性放行：DSV4 的 prompt 捐赠等场景会临时允许插入一次。
+    # ── allow_radix_cache_insert_once：给 skip_radix_cache_insert 开一个"一次性后门" ──
+    #   背景：三类请求默认【不许进树】（skip_radix_cache_insert = True）
+    #     ① fake/synthetic 压测请求（schedule_batch.py:1369）—— KV 是假的，进树会污染缓存
+    #     ② beam search 的 leader（beam_search/coordinator.py:221）——
+    #        它后半段是"beam 路径"，会分叉，不是可共享前缀
+    #     ③ DSV4 + PD decode（disaggregation/decode.py:2820）——
+    #        压缩 sidecar 在 decode 阶段重插不安全，整段插入被禁
+    #
+    #   但 ③ 有一个例外：decode 第一轮之后要**把 prompt 前缀捐给树**一次
+    #   （_maybe_insert_dsv4_decode_radix_prompt，batch_result_processor.py:184）。
+    #   那个函数会先把本标志置 True，于是这里放行一次；放行后立刻清掉
+    #   （用完即焚），避免后续 decode 步把"还没定稿的输出 token"也塞进树。
+    #
+    #   用 getattr 是因为该属性只由 DSV4 的这条路径设置，普通 Req 上没有。
     allow_once = getattr(req, "allow_radix_cache_insert_once", False)
 
     # 允许发布 → 真正入树（可能被 skip 挡住）

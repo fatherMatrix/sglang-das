@@ -985,28 +985,29 @@ class SWAComponent(TreeComponent):
                SWA 只属于当前请求自己（它的滑窗覆盖的是自己那条分支），
                拿去和树里共享没有意义 → 本次只插到分叉点为止。
 
-        ── 什么是"分支点"：SWA 的可复用边界永远是【最后一个窗口】───────────
-          为什么 SWA 的命中边界几乎总比 FULL 短：
-            FULL 每个 token 都留 KV          → 命中长度 = 内容匹配长度（可以很长）
-            SWA  只保留最后一个窗口的 live KV → 命中长度 ≈ 内容匹配长度也行，
-                 但更早的节点是【墓碑】（长度记着、KV 已经还掉）
-          于是 match 会给出两个数：
-            full_kv_hit_length  = FULL 能复用到哪（长）
-            swa_boundary_len    = SWA  能复用到哪（短，通常 = 长 - 若干窗口）
+        ── 什么是"分支点"：FULL 的命中边界 vs SWA 的命中边界 ──────────────
+          ★ 方向先记清：**SWA 保留的是"后面"——最后 W 个 token（尾部窗口）**。
+            前面的 SWA 早被 free_out_of_window_slots 还掉，节点上只剩墓碑
+            （长度还在、KV 没了）。所以"live 在前"是错的，live 永远在尾部。
 
-          举例（page_size 缩成 4、sliding_window 缩成 8）：
+          典型情形（不截断，绝大多数路径走这里）：
 
-            token :  0 1 2 3 | 4 5 6 7 | 8 9 10 11 | 12 13 … 19
-            FULL  :  |<--------- 命中 12 ----------->|
-            SWA   :  |<--- 命中 8 --->|                ← 只有最后一段是 live
-                                     ↑ swa_boundary_len = 8
-            ⇒ branching_seqlen = 页对齐(12) = 12      ← FULL 的边界
+              token :  0 1 2 3 | 4 5 6 7 | 8 9 10 11 | 12 …
+              FULL  :  |<----------- 命中 12 --------->|
+              SWA   :  |← 已还（墓碑） →|← live（最后 8 个）→|
+                                                  ↑ 两边都到 12
+              ⇒ aligned(12) > 12 为假 ⇒ branching = None ⇒ 本方法 return None
 
-          这两个数不一致本身不是错误：8..12 这段本来就"FULL 有、SWA 没有"。
-          branching 只是把 FULL 的边界记下来，交给插入逻辑决定"SWA 最多铺到哪"。
+          branching 出现的情形，代码注释原文是
+          "Full KV may extend beyond the latest reusable SWA window"：
+              full_kv_hit_length（FULL 能拿到的最长前缀，可能含 host 部分）
+                > device_prefix_len + host_hit_length（本次 match 实际落地的边界）
+              ⇒ branching_seqlen = 页对齐(full_kv_hit_length)
+          它的含义只是：**"FULL 比本次落地边界多出来的那段，从哪开始"** ——
+          插入时不能假装 SWA 也覆盖了那一段。
 
           ★ 真正截断的判据（下面 ③-b）：只有 branching > cache_protected_len
-            （即"分叉点在树已拥有部分之外"）才截断；否则返回 None。
+            （即"这段在树已拥有部分之外"）才截断；否则返回 None。
             插入完成后 commit_insert_component_data 会算
               result.swa_branch_inserted = (len(key) >= branching)
             表示"本次插入有没有跨过这个边界"。
